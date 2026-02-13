@@ -43,6 +43,9 @@ pub struct Viewer {
     pub current_frame: usize,
     pub next_frame_time: Option<Instant>,
 
+    /// Whether to scale small images up to fit the window.
+    fit_to_window: bool,
+
     // EXIF overlay state
     show_exif: bool,
     exif_lines: Vec<String>,
@@ -63,6 +66,7 @@ impl Viewer {
             scaled_cache_key: (0, 0, 0, 0),
             current_frame: 0,
             next_frame_time: None,
+            fit_to_window: false,
             show_exif: false,
             exif_lines: Vec::new(),
         }
@@ -118,6 +122,13 @@ impl Viewer {
     pub fn zoom_reset(&mut self) {
         self.zoom = 1.0;
         self.stop_all_pan();
+    }
+
+    pub fn toggle_fit_to_window(&mut self) {
+        self.fit_to_window = !self.fit_to_window;
+        self.zoom = 1.0;
+        self.stop_all_pan();
+        self.scaled_cache = None;
     }
 
     /// Start panning in the given direction.
@@ -277,7 +288,12 @@ impl Viewer {
         }
 
         // Calculate fit-to-window scale
-        self.fit_scale = (win_w as f64 / src_w as f64).min(win_h as f64 / src_h as f64);
+        let scale = (win_w as f64 / src_w as f64).min(win_h as f64 / src_h as f64);
+        self.fit_scale = if self.fit_to_window {
+            scale
+        } else {
+            scale.min(1.0)
+        };
         let actual_scale = self.fit_scale * self.zoom;
 
         // Scale image (cached — only recompute when zoom/window/frame changes)

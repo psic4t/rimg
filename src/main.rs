@@ -27,6 +27,7 @@ fn print_help() {
     println!("  +/-/0        Zoom in/out/reset");
     println!("  h/j/k/l      Navigate (also arrow keys)");
     println!("  Ctrl+h/j/k/l Pan when zoomed (also Ctrl+arrows)");
+    println!("  Ctrl+w       Toggle fit-to-window for small images");
     println!("  r/R          Rotate clockwise/counterclockwise");
     println!("  Enter        Toggle gallery mode");
     println!("  q/Escape     Quit");
