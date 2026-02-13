@@ -497,6 +497,10 @@ impl App {
                 self.viewer.toggle_fit_to_window();
                 self.needs_redraw = true;
             }
+            Action::ActualSize => {
+                self.viewer.zoom_actual_size();
+                self.needs_redraw = true;
+            }
             Action::PanStart(dir) => {
                 self.viewer.pan_start(dir);
                 // No needs_redraw here — update_pan() in the event loop handles it

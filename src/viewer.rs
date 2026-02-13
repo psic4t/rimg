@@ -45,6 +45,8 @@ pub struct Viewer {
 
     /// Whether to scale small images up to fit the window.
     fit_to_window: bool,
+    /// Flag: next render should set zoom to display at 1:1 pixel size.
+    actual_size: bool,
 
     // EXIF overlay state
     show_exif: bool,
@@ -67,6 +69,7 @@ impl Viewer {
             current_frame: 0,
             next_frame_time: None,
             fit_to_window: false,
+            actual_size: false,
             show_exif: false,
             exif_lines: Vec::new(),
         }
@@ -128,6 +131,12 @@ impl Viewer {
         self.fit_to_window = !self.fit_to_window;
         self.zoom = 1.0;
         self.stop_all_pan();
+        self.scaled_cache = None;
+    }
+
+    pub fn zoom_actual_size(&mut self) {
+        self.fit_to_window = false;
+        self.actual_size = true;
         self.scaled_cache = None;
     }
 
@@ -294,6 +303,11 @@ impl Viewer {
         } else {
             scale.min(1.0)
         };
+        if self.actual_size {
+            self.zoom = 1.0 / self.fit_scale;
+            self.stop_all_pan();
+            self.actual_size = false;
+        }
         let actual_scale = self.fit_scale * self.zoom;
 
         // Scale image (cached — only recompute when zoom/window/frame changes)

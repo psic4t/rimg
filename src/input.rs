@@ -8,6 +8,7 @@ const KEY_J: u32 = 36;
 const KEY_K: u32 = 37;
 const KEY_L: u32 = 38;
 const KEY_W: u32 = 17;
+const KEY_0: u32 = 11;
 
 /// Pan direction indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,7 @@ pub enum Action {
     RotateCCW,
     ToggleExif,
     FitToWindow,
+    ActualSize,
 
     // Gallery actions
     MoveLeft,
@@ -107,6 +109,9 @@ fn map_viewer_key(keycode: u32, sym: u32, ctrl: bool) -> Option<Action> {
         }
         if keycode == KEY_W {
             return Some(Action::FitToWindow);
+        }
+        if keycode == KEY_0 {
+            return Some(Action::ActualSize);
         }
     }
 
