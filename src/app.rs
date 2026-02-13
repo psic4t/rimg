@@ -21,12 +21,13 @@ pub struct App {
     win_w: u32,
     win_h: u32,
     needs_redraw: bool,
+    wallpaper_mode: bool,
 }
 
 impl App {
-    pub fn new(paths: Vec<PathBuf>) -> Self {
+    pub fn new(paths: Vec<PathBuf>, wallpaper_mode: bool) -> Self {
         let conn = Connection::connect_to_env().expect("Failed to connect to Wayland");
-        let state = WaylandState::new();
+        let state = WaylandState::new(wallpaper_mode);
 
         Self {
             state,
@@ -40,10 +41,19 @@ impl App {
             win_w: 0,
             win_h: 0,
             needs_redraw: true,
+            wallpaper_mode,
         }
     }
 
     pub fn run(&mut self) {
+        if self.wallpaper_mode {
+            self.run_wallpaper();
+            return;
+        }
+        self.run_viewer();
+    }
+
+    fn run_viewer(&mut self) {
         let mut event_queue = self.conn.new_event_queue();
         let qh = event_queue.handle();
 
@@ -136,6 +146,9 @@ impl App {
                             self.redraw();
                         }
                     }
+                    WaylandEvent::WallpaperConfigure { .. } => {
+                        // Not in wallpaper mode, ignore
+                    }
                 }
             }
 
@@ -162,6 +175,102 @@ impl App {
                 // If animating, request next frame callback
                 if self.mode == Mode::Viewer && self.viewer.next_frame_deadline().is_some() {
                     self.state.request_frame(&qh);
+                }
+            }
+        }
+    }
+
+    fn run_wallpaper(&mut self) {
+        let mut event_queue = self.conn.new_event_queue();
+        let qh = event_queue.handle();
+
+        // Register globals
+        let display = self.conn.display();
+        display.get_registry(&qh, ());
+
+        // Initial roundtrip to bind globals (compositor, shm, outputs, layer_shell)
+        event_queue
+            .roundtrip(&mut self.state)
+            .expect("Roundtrip failed");
+
+        // Second roundtrip to get output mode events
+        event_queue
+            .roundtrip(&mut self.state)
+            .expect("Roundtrip failed");
+
+        // Verify layer shell is available
+        if !self.state.has_layer_shell() {
+            eprintln!("Error: compositor does not support wlr-layer-shell protocol");
+            eprintln!(
+                "Wallpaper mode requires a wlroots-based compositor (sway, dwl, hyprland, etc.)"
+            );
+            std::process::exit(1);
+        }
+
+        // Load the first image
+        self.ensure_image_loaded();
+        let loaded = match self.image_cache.get(&0) {
+            Some(l) => l,
+            None => {
+                eprintln!("Error: failed to load wallpaper image");
+                std::process::exit(1);
+            }
+        };
+
+        // Get the first frame (static or first frame of animated)
+        let frame = match loaded {
+            LoadedImage::Static(img) => img.clone(),
+            LoadedImage::Animated { frames } => frames[0].0.clone(),
+        };
+
+        // Create layer surfaces for all outputs
+        self.state.create_wallpaper_surfaces(&qh);
+
+        // Flush to send the surface creation + initial commits
+        let _ = self.conn.flush();
+
+        // Main event loop
+        let raw_fd = self.conn.backend().poll_fd().as_raw_fd();
+        let wl_fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+
+        while self.state.running {
+            let _ = self.conn.flush();
+
+            // Block indefinitely — wallpaper is static
+            let mut pollfd = rustix::event::PollFd::new(&wl_fd, rustix::event::PollFlags::IN);
+            let _ = rustix::event::poll(std::slice::from_mut(&mut pollfd), -1);
+
+            if let Some(guard) = event_queue.prepare_read() {
+                if let Ok(_) = guard.read() {
+                    // Events read successfully
+                }
+            }
+            event_queue
+                .dispatch_pending(&mut self.state)
+                .expect("Dispatch failed");
+
+            let events: Vec<WaylandEvent> = self.state.events.drain(..).collect();
+            for event in events {
+                match event {
+                    WaylandEvent::WallpaperConfigure {
+                        output_idx,
+                        width,
+                        height,
+                    } => {
+                        // Resize SHM buffers for this output
+                        self.state
+                            .resize_wallpaper_buffers(output_idx, width, height, &qh);
+
+                        // Render wallpaper: scale-to-fill and convert to XRGB
+                        let filled = crate::render::scale_to_fill(&frame, width, height);
+                        let pixels = rgba_to_xrgb(&filled);
+
+                        self.state.present_wallpaper(output_idx, &pixels);
+                    }
+                    WaylandEvent::Close => {
+                        return;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -394,4 +503,19 @@ impl App {
         }
         false
     }
+}
+
+/// Convert an RgbaImage to a Vec<u32> XRGB8888 pixel buffer.
+fn rgba_to_xrgb(img: &crate::image_loader::RgbaImage) -> Vec<u32> {
+    let raw = img.as_raw();
+    let (w, h) = img.dimensions();
+    let mut buf = Vec::with_capacity((w * h) as usize);
+    for i in 0..(w * h) as usize {
+        let idx = i * 4;
+        let r = raw[idx] as u32;
+        let g = raw[idx + 1] as u32;
+        let b = raw[idx + 2] as u32;
+        buf.push((r << 16) | (g << 8) | b);
+    }
+    buf
 }

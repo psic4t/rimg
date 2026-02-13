@@ -17,6 +17,49 @@ pub fn scale_to_fit(img: &RgbaImage, max_w: u32, max_h: u32) -> RgbaImage {
     resize_rgba(img, dst_w, dst_h)
 }
 
+/// Scale an RGBA image to fill (cover) the target dimensions, then center-crop.
+/// Uses scale = max(target_w / img_w, target_h / img_h) so the image always
+/// covers the entire area. Returns an RgbaImage of exactly target_w x target_h.
+pub fn scale_to_fill(img: &RgbaImage, target_w: u32, target_h: u32) -> RgbaImage {
+    let (src_w, src_h) = img.dimensions();
+    if src_w == 0 || src_h == 0 || target_w == 0 || target_h == 0 {
+        return RgbaImage::new(1, 1);
+    }
+
+    let scale = (target_w as f64 / src_w as f64).max(target_h as f64 / src_h as f64);
+    let scaled_w = ((src_w as f64 * scale).round() as u32).max(1);
+    let scaled_h = ((src_h as f64 * scale).round() as u32).max(1);
+
+    let scaled = resize_rgba(img, scaled_w, scaled_h);
+
+    // Center-crop to exact target dimensions
+    if scaled_w == target_w && scaled_h == target_h {
+        return scaled;
+    }
+
+    let crop_x = (scaled_w.saturating_sub(target_w)) / 2;
+    let crop_y = (scaled_h.saturating_sub(target_h)) / 2;
+    let raw = scaled.as_raw();
+    let mut out = vec![0u8; (target_w * target_h * 4) as usize];
+
+    for y in 0..target_h {
+        let sy = crop_y + y;
+        if sy >= scaled_h {
+            break;
+        }
+        let src_row = (sy * scaled_w + crop_x) as usize * 4;
+        let dst_row = (y * target_w) as usize * 4;
+        let copy_w = target_w.min(scaled_w - crop_x) as usize * 4;
+        out[dst_row..dst_row + copy_w].copy_from_slice(&raw[src_row..src_row + copy_w]);
+    }
+
+    RgbaImage {
+        data: out,
+        width: target_w,
+        height: target_h,
+    }
+}
+
 /// Scale an RGBA image by a zoom factor.
 pub fn scale_by_factor(img: &RgbaImage, factor: f64) -> RgbaImage {
     let (src_w, src_h) = img.dimensions();

@@ -16,8 +16,11 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
     if args.is_empty() {
-        eprintln!("Usage: rimg <file>... | rimg <directory>");
+        eprintln!("Usage: rimg [options] <file>... | rimg [options] <directory>");
         eprintln!("  Supported formats: jpg, jpeg, png, gif, webp");
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("  -w           Set image as wallpaper (wlr-layer-shell)");
         eprintln!();
         eprintln!("Keys:");
         eprintln!("  n/Space      Next image");
@@ -31,13 +34,22 @@ fn main() {
         process::exit(1);
     }
 
-    let paths = image_loader::collect_paths(&args);
+    // Parse -w flag
+    let wallpaper_mode = args.iter().any(|a| a == "-w");
+    let file_args: Vec<String> = args.into_iter().filter(|a| a != "-w").collect();
+
+    if file_args.is_empty() {
+        eprintln!("Error: no image files specified");
+        process::exit(1);
+    }
+
+    let paths = image_loader::collect_paths(&file_args);
 
     if paths.is_empty() {
         eprintln!("Error: no supported image files found");
         process::exit(1);
     }
 
-    let mut app = app::App::new(paths);
+    let mut app = app::App::new(paths, wallpaper_mode);
     app.run();
 }

@@ -4,12 +4,13 @@ use rustix::fs::{memfd_create, MemfdFlags};
 use rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
 
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
-    wl_callback,
+    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_registry, wl_seat, wl_shm,
+    wl_shm_pool, wl_surface,
 };
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle, WEnum};
 
 use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use crate::protocols::wlr_layer_shell::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 /// Keyboard event data passed to the application.
 pub struct KeyEvent {
@@ -26,6 +27,27 @@ pub enum WaylandEvent {
     Close,
     Key(KeyEvent),
     FrameCallback,
+    /// A wallpaper layer surface has been configured with output dimensions.
+    WallpaperConfigure { output_idx: usize, width: u32, height: u32 },
+}
+
+/// Tracked output information.
+struct OutputInfo {
+    #[allow(dead_code)]
+    name: u32,
+    output: wl_output::WlOutput,
+    width: u32,
+    height: u32,
+}
+
+/// Per-output wallpaper surface with its own wl_surface, SHM buffer, and layer surface.
+pub(crate) struct WallpaperSurface {
+    surface: wl_surface::WlSurface,
+    #[allow(dead_code)]
+    layer_surface: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    shm_buf: ShmBuffer,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// SHM double-buffer management.
@@ -198,13 +220,19 @@ pub struct WaylandState {
     xkb_keymap: *mut xkbcommon_dl::xkb_keymap,
     xkb_state: *mut xkbcommon_dl::xkb_state,
     ctrl_pressed: bool,
+
+    // Wallpaper mode
+    pub wallpaper_mode: bool,
+    outputs: Vec<OutputInfo>,
+    layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    pub wallpaper_surfaces: Vec<WallpaperSurface>,
 }
 
 // Safety: WaylandState is only used from the main thread.
 unsafe impl Send for WaylandState {}
 
 impl WaylandState {
-    pub fn new() -> Self {
+    pub fn new(wallpaper_mode: bool) -> Self {
         let xkb = xkbcommon_dl::xkbcommon_handle();
         let xkb_context = unsafe {
             (xkb.xkb_context_new)(xkbcommon_dl::xkb_context_flags::XKB_CONTEXT_NO_FLAGS)
@@ -230,6 +258,10 @@ impl WaylandState {
             xkb_keymap: std::ptr::null_mut(),
             xkb_state: std::ptr::null_mut(),
             ctrl_pressed: false,
+            wallpaper_mode,
+            outputs: Vec::new(),
+            layer_shell: None,
+            wallpaper_surfaces: Vec::new(),
         }
     }
 
@@ -309,6 +341,108 @@ impl WaylandState {
     pub fn height(&self) -> u32 {
         self.shm_buf.height
     }
+
+    /// Check if the layer shell protocol was bound.
+    pub fn has_layer_shell(&self) -> bool {
+        self.layer_shell.is_some()
+    }
+
+    /// Create wallpaper layer surfaces for all discovered outputs.
+    pub fn create_wallpaper_surfaces(&mut self, qh: &QueueHandle<WaylandState>) {
+        let layer_shell = match &self.layer_shell {
+            Some(ls) => ls.clone(),
+            None => return,
+        };
+        let compositor = match &self.compositor {
+            Some(c) => c.clone(),
+            None => return,
+        };
+
+        for (idx, output_info) in self.outputs.iter().enumerate() {
+            let surface = compositor.create_surface(qh, ());
+            let layer_surface = layer_shell.get_layer_surface(
+                &surface,
+                Some(&output_info.output),
+                zwlr_layer_shell_v1::Layer::Background,
+                "wallpaper".into(),
+                qh,
+                idx,
+            );
+
+            // Anchor to all four edges
+            layer_surface.set_anchor(
+                zwlr_layer_surface_v1::Anchor::Top
+                    | zwlr_layer_surface_v1::Anchor::Bottom
+                    | zwlr_layer_surface_v1::Anchor::Left
+                    | zwlr_layer_surface_v1::Anchor::Right,
+            );
+            // Exclusive zone -1: extend under panels
+            layer_surface.set_exclusive_zone(-1);
+            // No keyboard interactivity
+            layer_surface.set_keyboard_interactivity(
+                zwlr_layer_surface_v1::KeyboardInteractivity::None,
+            );
+            // Size 0,0: let compositor assign output dimensions
+            layer_surface.set_size(0, 0);
+
+            // Initial commit without buffer to trigger configure
+            surface.commit();
+
+            self.wallpaper_surfaces.push(WallpaperSurface {
+                surface,
+                layer_surface,
+                shm_buf: ShmBuffer::new(),
+                width: 0,
+                height: 0,
+            });
+        }
+    }
+
+    /// Write pixel data to a wallpaper surface's back buffer and present.
+    pub fn present_wallpaper(&mut self, output_idx: usize, pixels: &[u32]) {
+        let ws = match self.wallpaper_surfaces.get_mut(output_idx) {
+            Some(ws) => ws,
+            None => return,
+        };
+        if ws.width == 0 || ws.height == 0 {
+            return;
+        }
+
+        // Ensure SHM buffer is allocated
+        if ws.shm_buf.width != ws.width || ws.shm_buf.height != ws.height {
+            // The buffer should already be resized from configure handling.
+            return;
+        }
+
+        let back = ws.shm_buf.back_buffer_mut();
+        let len = back.len().min(pixels.len());
+        back[..len].copy_from_slice(&pixels[..len]);
+
+        if let Some(buffer) = ws.shm_buf.swap() {
+            ws.surface.attach(Some(buffer), 0, 0);
+            ws.surface.damage_buffer(0, 0, ws.width as i32, ws.height as i32);
+            ws.surface.commit();
+        }
+    }
+
+    /// Resize a wallpaper surface's SHM buffers.
+    pub fn resize_wallpaper_buffers(
+        &mut self,
+        output_idx: usize,
+        width: u32,
+        height: u32,
+        qh: &QueueHandle<WaylandState>,
+    ) {
+        let shm = match &self.shm.clone() {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        if let Some(ws) = self.wallpaper_surfaces.get_mut(output_idx) {
+            ws.width = width;
+            ws.height = height;
+            ws.shm_buf.resize(width, height, &shm, qh);
+        }
+    }
 }
 
 impl Drop for WaylandState {
@@ -347,11 +481,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                 "wl_compositor" => {
                     let compositor =
                         registry.bind::<wl_compositor::WlCompositor, _, _>(name, 4.min(version), qh, ());
-                    let surface = compositor.create_surface(qh, ());
+                    if !state.wallpaper_mode {
+                        let surface = compositor.create_surface(qh, ());
+                        state.surface = Some(surface);
+                    }
                     state.compositor = Some(compositor);
-                    state.surface = Some(surface);
 
-                    if state.wm_base.is_some() && state.xdg_surface.is_none() {
+                    if !state.wallpaper_mode
+                        && state.wm_base.is_some()
+                        && state.xdg_surface.is_none()
+                    {
                         state.init_xdg_surface(qh);
                     }
                 }
@@ -360,15 +499,43 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                     state.shm = Some(shm);
                 }
                 "wl_seat" => {
-                    registry.bind::<wl_seat::WlSeat, _, _>(name, 4.min(version), qh, ());
+                    if !state.wallpaper_mode {
+                        registry.bind::<wl_seat::WlSeat, _, _>(name, 4.min(version), qh, ());
+                    }
                 }
                 "xdg_wm_base" => {
-                    let wm_base =
-                        registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ());
-                    state.wm_base = Some(wm_base);
+                    if !state.wallpaper_mode {
+                        let wm_base =
+                            registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ());
+                        state.wm_base = Some(wm_base);
 
-                    if state.surface.is_some() && state.xdg_surface.is_none() {
-                        state.init_xdg_surface(qh);
+                        if state.surface.is_some() && state.xdg_surface.is_none() {
+                            state.init_xdg_surface(qh);
+                        }
+                    }
+                }
+                "wl_output" => {
+                    if state.wallpaper_mode {
+                        let output = registry
+                            .bind::<wl_output::WlOutput, _, _>(name, 2.min(version), qh, ());
+                        state.outputs.push(OutputInfo {
+                            name,
+                            output,
+                            width: 0,
+                            height: 0,
+                        });
+                    }
+                }
+                "zwlr_layer_shell_v1" => {
+                    if state.wallpaper_mode {
+                        let layer_shell = registry
+                            .bind::<zwlr_layer_shell_v1::ZwlrLayerShellV1, _, _>(
+                                name,
+                                1,
+                                qh,
+                                (),
+                            );
+                        state.layer_shell = Some(layer_shell);
                     }
                 }
                 _ => {}
@@ -592,6 +759,80 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
         if let wl_callback::Event::Done { .. } = event {
             state.frame_pending = false;
             state.events.push(WaylandEvent::FrameCallback);
+        }
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        output: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Mode {
+            flags: WEnum::Value(flags),
+            width,
+            height,
+            ..
+        } = event
+        {
+            if flags.contains(wl_output::Mode::Current) {
+                // Find and update the matching output
+                for info in &mut state.outputs {
+                    if info.output == *output {
+                        info.width = width as u32;
+                        info.height = height as u32;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for WaylandState {
+    fn event(
+        _: &mut Self,
+        _: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
+        _: zwlr_layer_shell_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // No events defined for the layer shell manager
+    }
+}
+
+/// The usize user data is the output index.
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, usize> for WaylandState {
+    fn event(
+        state: &mut Self,
+        layer_surface: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        output_idx: &usize,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                layer_surface.ack_configure(serial);
+                state.events.push(WaylandEvent::WallpaperConfigure {
+                    output_idx: *output_idx,
+                    width,
+                    height,
+                });
+            }
+            zwlr_layer_surface_v1::Event::Closed => {
+                state.running = false;
+                state.events.push(WaylandEvent::Close);
+            }
         }
     }
 }
