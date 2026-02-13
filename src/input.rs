@@ -21,6 +21,7 @@ pub enum Action {
     PanRight,
     PanUp,
     PanDown,
+    Fullscreen,
 
     // Gallery actions
     MoveLeft,
@@ -98,6 +99,7 @@ fn map_viewer_key(sym: u32, ctrl: bool) -> Option<Action> {
                 Some(Action::MoveDown)
             }
         }
+        keysyms::f => Some(Action::Fullscreen),
         keysyms::space => Some(Action::NextImage),
         keysyms::BackSpace => Some(Action::PrevImage),
         _ => None,

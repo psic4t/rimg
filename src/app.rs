@@ -328,6 +328,9 @@ impl App {
                 self.viewer.pan_down();
                 self.needs_redraw = true;
             }
+            Action::Fullscreen => {
+                self.state.toggle_fullscreen();
+            }
             Action::MoveLeft => {
                 if self.mode == Mode::Viewer {
                     let prev = if self.current_index == 0 {

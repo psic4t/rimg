@@ -190,6 +190,7 @@ pub struct WaylandState {
     configured: bool,
     pending_configure_size: Option<(u32, u32)>,
     pub events: Vec<WaylandEvent>,
+    fullscreen: bool,
     frame_pending: bool,
 
     // xkbcommon state
@@ -223,6 +224,7 @@ impl WaylandState {
             configured: false,
             pending_configure_size: None,
             events: Vec::new(),
+            fullscreen: false,
             frame_pending: false,
             xkb_context,
             xkb_keymap: std::ptr::null_mut(),
@@ -249,6 +251,17 @@ impl WaylandState {
     pub fn set_title(&self, title: &str) {
         if let Some(toplevel) = &self.toplevel {
             toplevel.set_title(title.into());
+        }
+    }
+
+    /// Toggle fullscreen state.
+    pub fn toggle_fullscreen(&self) {
+        if let Some(toplevel) = &self.toplevel {
+            if self.fullscreen {
+                toplevel.unset_fullscreen();
+            } else {
+                toplevel.set_fullscreen(None);
+            }
         }
     }
 
@@ -422,8 +435,13 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandState {
             xdg_toplevel::Event::Configure {
                 width,
                 height,
-                ..
+                states,
             } => {
+                // Check if fullscreen state (value=2) is in the states array
+                // States are u32 values encoded as native-endian in the byte array
+                state.fullscreen = states
+                    .chunks_exact(4)
+                    .any(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) == 2);
                 // Store pending size — will be used when xdg_surface::Configure arrives
                 state.pending_configure_size = Some((width as u32, height as u32));
             }
