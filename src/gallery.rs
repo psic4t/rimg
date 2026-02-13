@@ -16,6 +16,10 @@ const PADDING: u32 = 10;
 const BORDER_W: u32 = 3;
 /// Selection border color (white-ish).
 const SELECTION_COLOR: u32 = 0x00CCCCCC;
+/// Selection overlay alpha (0-255). Lower = more subtle.
+const SELECTION_ALPHA: u32 = 50;
+/// Selection corner radius (matches exif info overlay).
+const SELECTION_RADIUS: u32 = 6;
 /// Placeholder color (dark gray).
 const PLACEHOLDER_COLOR: u32 = 0x00333333;
 
@@ -218,12 +222,22 @@ impl Gallery {
 
             // Draw selection border or placeholder background
             if i == self.selected {
-                // Selection: draw border
+                // Selection: draw rounded border
                 let bx = x.saturating_sub(BORDER_W);
                 let by = dy.saturating_sub(if y >= 0 { BORDER_W } else { 0 });
                 let bw = THUMB_SIZE + BORDER_W * 2;
                 let bh = THUMB_SIZE + BORDER_W * 2;
-                render::fill_rect(&mut buf, win_w, bx, by, bw, bh, SELECTION_COLOR);
+                render::fill_rect_rounded_blend(
+                    &mut buf,
+                    win_w,
+                    bx,
+                    by,
+                    bw,
+                    bh,
+                    SELECTION_COLOR,
+                    SELECTION_ALPHA,
+                    SELECTION_RADIUS,
+                );
             }
 
             if let Some(thumb) = self.thumbnails.get(&i) {
