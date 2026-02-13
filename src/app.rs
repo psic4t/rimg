@@ -88,17 +88,32 @@ impl App {
             // Flush outgoing messages
             let _ = self.conn.flush();
 
-            // Calculate poll timeout based on GIF animation or pending thumbnails
+            // Calculate poll timeout based on GIF animation, pan animation, or pending thumbnails
             let timeout_ms = if self.mode == Mode::Viewer {
-                if let Some(deadline) = self.viewer.next_frame_deadline() {
-                    let now = Instant::now();
+                let now = Instant::now();
+                let gif_timeout = if let Some(deadline) = self.viewer.next_frame_deadline() {
                     if deadline > now {
                         deadline.duration_since(now).as_millis() as i32
                     } else {
-                        0 // Frame is due now
+                        0
                     }
                 } else {
-                    -1 // Block indefinitely
+                    -1
+                };
+                let pan_timeout = if let Some(deadline) = self.viewer.pan_deadline() {
+                    if deadline > now {
+                        deadline.duration_since(now).as_millis() as i32
+                    } else {
+                        0
+                    }
+                } else {
+                    -1
+                };
+                // Use the smallest non-negative timeout, or -1 if both are indefinite
+                match (gif_timeout, pan_timeout) {
+                    (-1, -1) => -1,
+                    (-1, t) | (t, -1) => t,
+                    (a, b) => a.min(b),
                 }
             } else if self.mode == Mode::Gallery && self.gallery.has_pending() {
                 16 // Poll at ~60fps while thumbnails are being generated
@@ -169,12 +184,22 @@ impl App {
                 }
             }
 
+            // Handle pan animation
+            if self.mode == Mode::Viewer {
+                if self.viewer.update_pan() {
+                    self.needs_redraw = true;
+                }
+            }
+
             // Draw if needed
             if self.needs_redraw && self.win_w > 0 && self.win_h > 0 {
                 self.redraw();
 
-                // If animating, request next frame callback
-                if self.mode == Mode::Viewer && self.viewer.next_frame_deadline().is_some() {
+                // If animating (GIF or pan), request next frame callback
+                if self.mode == Mode::Viewer
+                    && (self.viewer.next_frame_deadline().is_some()
+                        || self.viewer.is_pan_animating())
+                {
                     self.state.request_frame(&qh);
                 }
             }
@@ -468,21 +493,12 @@ impl App {
                 self.viewer.zoom_reset();
                 self.needs_redraw = true;
             }
-            Action::PanLeft => {
-                self.viewer.pan_left();
-                self.needs_redraw = true;
+            Action::PanStart(dir) => {
+                self.viewer.pan_start(dir);
+                // No needs_redraw here — update_pan() in the event loop handles it
             }
-            Action::PanRight => {
-                self.viewer.pan_right();
-                self.needs_redraw = true;
-            }
-            Action::PanUp => {
-                self.viewer.pan_up();
-                self.needs_redraw = true;
-            }
-            Action::PanDown => {
-                self.viewer.pan_down();
-                self.needs_redraw = true;
+            Action::PanStop(dir) => {
+                self.viewer.pan_stop(dir);
             }
             Action::Fullscreen => {
                 self.state.toggle_fullscreen();

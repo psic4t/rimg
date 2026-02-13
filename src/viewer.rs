@@ -1,24 +1,43 @@
 use crate::font;
 use crate::image_loader::LoadedImage;
 use crate::image_loader::RgbaImage;
+use crate::input::PanDirection;
 use crate::render;
 use crate::status;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Zoom step factor.
 const ZOOM_STEP: f64 = 1.25;
-/// Pan step in pixels.
-const PAN_STEP: i32 = 50;
+
+/// Constant pan speed in pixels per second.
+const PAN_SPEED: f64 = 600.0;
+/// Target frame interval for pan animation (~60fps).
+const PAN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Cache key for the scaled image: (actual_scale_bits, win_w, win_h, frame_index).
+/// We store scale as u64 bits to get exact equality checks.
+type ScaleCacheKey = (u64, u32, u32, usize);
 
 pub struct Viewer {
     /// Current zoom level (1.0 = fit-to-window).
     zoom: f64,
-    /// Pan offset from center (in display pixels).
+    /// Pan offset from center (integer, for rendering).
     pan_x: i32,
     pan_y: i32,
+    /// Pan offset from center (floating-point, for smooth sub-pixel movement).
+    pan_x_f: f64,
+    pan_y_f: f64,
+    /// Which pan directions are currently held down.
+    pan_active: [bool; 4],
+    /// Timestamp of last pan animation tick.
+    last_pan_tick: Option<Instant>,
     /// Fit-to-window scale factor for current image + window size.
     fit_scale: f64,
+
+    /// Cached scaled image to avoid re-scaling every frame during panning.
+    scaled_cache: Option<RgbaImage>,
+    scaled_cache_key: ScaleCacheKey,
 
     // Animation state
     pub current_frame: usize,
@@ -35,7 +54,13 @@ impl Viewer {
             zoom: 1.0,
             pan_x: 0,
             pan_y: 0,
+            pan_x_f: 0.0,
+            pan_y_f: 0.0,
+            pan_active: [false; 4],
+            last_pan_tick: None,
             fit_scale: 1.0,
+            scaled_cache: None,
+            scaled_cache_key: (0, 0, 0, 0),
             current_frame: 0,
             next_frame_time: None,
             show_exif: false,
@@ -47,6 +72,11 @@ impl Viewer {
         self.zoom = 1.0;
         self.pan_x = 0;
         self.pan_y = 0;
+        self.pan_x_f = 0.0;
+        self.pan_y_f = 0.0;
+        self.pan_active = [false; 4];
+        self.last_pan_tick = None;
+        self.scaled_cache = None;
         self.current_frame = 0;
         self.next_frame_time = None;
         self.show_exif = false;
@@ -81,38 +111,112 @@ impl Viewer {
     pub fn zoom_out(&mut self) {
         self.zoom = (self.zoom / ZOOM_STEP).max(1.0);
         if self.zoom <= 1.0 {
-            self.pan_x = 0;
-            self.pan_y = 0;
+            self.stop_all_pan();
         }
     }
 
     pub fn zoom_reset(&mut self) {
         self.zoom = 1.0;
+        self.stop_all_pan();
+    }
+
+    /// Start panning in the given direction.
+    pub fn pan_start(&mut self, dir: PanDirection) {
+        if self.zoom <= 1.0 {
+            return;
+        }
+        self.pan_active[dir as usize] = true;
+        if self.last_pan_tick.is_none() {
+            self.last_pan_tick = Some(Instant::now());
+        }
+    }
+
+    /// Stop panning in the given direction (key released).
+    pub fn pan_stop(&mut self, dir: PanDirection) {
+        self.pan_active[dir as usize] = false;
+    }
+
+    /// Reset all pan state to zero.
+    fn stop_all_pan(&mut self) {
         self.pan_x = 0;
         self.pan_y = 0;
+        self.pan_x_f = 0.0;
+        self.pan_y_f = 0.0;
+        self.pan_active = [false; 4];
+        self.last_pan_tick = None;
     }
 
-    pub fn pan_left(&mut self) {
-        if self.zoom > 1.0 {
-            self.pan_x += PAN_STEP;
+    /// Update pan position at constant speed based on which keys are held.
+    /// Returns true if any pan key is active (needs continued redraws).
+    pub fn update_pan(&mut self) -> bool {
+        if !self.is_pan_animating() {
+            self.last_pan_tick = None;
+            return false;
         }
-    }
 
-    pub fn pan_right(&mut self) {
-        if self.zoom > 1.0 {
-            self.pan_x -= PAN_STEP;
+        if self.zoom <= 1.0 {
+            self.stop_all_pan();
+            return false;
         }
-    }
 
-    pub fn pan_up(&mut self) {
-        if self.zoom > 1.0 {
-            self.pan_y += PAN_STEP;
+        let now = Instant::now();
+        let dt = if let Some(last) = self.last_pan_tick {
+            let elapsed = now.duration_since(last).as_secs_f64();
+            elapsed.min(0.1) // Cap to avoid huge jumps if the app stalls
+        } else {
+            0.0
+        };
+        self.last_pan_tick = Some(now);
+
+        if dt <= 0.0 {
+            return true;
         }
+
+        // Compute direction from active keys (immediate full speed, no ramp)
+        let mut dx: f64 = 0.0;
+        let mut dy: f64 = 0.0;
+        if self.pan_active[PanDirection::Left as usize] {
+            dx += 1.0;
+        }
+        if self.pan_active[PanDirection::Right as usize] {
+            dx -= 1.0;
+        }
+        if self.pan_active[PanDirection::Up as usize] {
+            dy += 1.0;
+        }
+        if self.pan_active[PanDirection::Down as usize] {
+            dy -= 1.0;
+        }
+
+        // Normalize diagonal so it doesn't move faster
+        let len = (dx * dx + dy * dy).sqrt();
+        if len > 0.0 {
+            dx /= len;
+            dy /= len;
+        }
+
+        // Move at constant speed
+        self.pan_x_f += dx * PAN_SPEED * dt;
+        self.pan_y_f += dy * PAN_SPEED * dt;
+
+        // Convert to integer for rendering
+        self.pan_x = self.pan_x_f.round() as i32;
+        self.pan_y = self.pan_y_f.round() as i32;
+
+        true
     }
 
-    pub fn pan_down(&mut self) {
-        if self.zoom > 1.0 {
-            self.pan_y -= PAN_STEP;
+    /// Returns true if any pan key is currently held.
+    pub fn is_pan_animating(&self) -> bool {
+        self.pan_active.iter().any(|&a| a)
+    }
+
+    /// Returns the deadline for the next pan animation frame, if animating.
+    pub fn pan_deadline(&self) -> Option<Instant> {
+        if self.is_pan_animating() {
+            Some(Instant::now() + PAN_FRAME_INTERVAL)
+        } else {
+            None
         }
     }
 
@@ -176,8 +280,17 @@ impl Viewer {
         self.fit_scale = (win_w as f64 / src_w as f64).min(win_h as f64 / src_h as f64);
         let actual_scale = self.fit_scale * self.zoom;
 
-        // Scale image
-        let scaled = render::scale_by_factor(frame, actual_scale);
+        // Scale image (cached — only recompute when zoom/window/frame changes)
+        let frame_idx = match loaded {
+            LoadedImage::Static(_) => 0,
+            LoadedImage::Animated { .. } => self.current_frame,
+        };
+        let cache_key: ScaleCacheKey = (actual_scale.to_bits(), win_w, win_h, frame_idx);
+        if self.scaled_cache.is_none() || self.scaled_cache_key != cache_key {
+            self.scaled_cache = Some(render::scale_by_factor(frame, actual_scale));
+            self.scaled_cache_key = cache_key;
+        }
+        let scaled = self.scaled_cache.as_ref().unwrap();
         let (scaled_w, scaled_h) = scaled.dimensions();
 
         // Clamp pan to keep image edges within window
@@ -185,6 +298,9 @@ impl Viewer {
         let max_pan_y = ((scaled_h as i32 - win_h as i32) / 2).max(0);
         self.pan_x = self.pan_x.clamp(-max_pan_x, max_pan_x);
         self.pan_y = self.pan_y.clamp(-max_pan_y, max_pan_y);
+        // Keep floating-point in sync with clamped integer values
+        self.pan_x_f = self.pan_x_f.clamp(-max_pan_x as f64, max_pan_x as f64);
+        self.pan_y_f = self.pan_y_f.clamp(-max_pan_y as f64, max_pan_y as f64);
 
         // Composite onto background
         let mut buf = render::composite_centered(&scaled, win_w, win_h, self.pan_x, self.pan_y);
