@@ -320,20 +320,56 @@ impl App {
                 self.needs_redraw = true;
             }
             Action::MoveLeft => {
-                self.gallery.move_left(self.paths.len());
-                self.needs_redraw = true;
+                if self.mode == Mode::Viewer {
+                    let prev = if self.current_index == 0 {
+                        self.paths.len().saturating_sub(1)
+                    } else {
+                        self.current_index - 1
+                    };
+                    self.navigate_to(prev);
+                } else {
+                    self.gallery.move_left(self.paths.len());
+                    self.needs_redraw = true;
+                }
             }
             Action::MoveRight => {
-                self.gallery.move_right(self.paths.len());
-                self.needs_redraw = true;
+                if self.mode == Mode::Viewer {
+                    let next = if self.current_index + 1 >= self.paths.len() {
+                        0
+                    } else {
+                        self.current_index + 1
+                    };
+                    self.navigate_to(next);
+                } else {
+                    self.gallery.move_right(self.paths.len());
+                    self.needs_redraw = true;
+                }
             }
             Action::MoveUp => {
-                self.gallery.move_up(self.paths.len());
-                self.needs_redraw = true;
+                if self.mode == Mode::Viewer {
+                    let prev = if self.current_index == 0 {
+                        self.paths.len().saturating_sub(1)
+                    } else {
+                        self.current_index - 1
+                    };
+                    self.navigate_to(prev);
+                } else {
+                    self.gallery.move_up(self.paths.len());
+                    self.needs_redraw = true;
+                }
             }
             Action::MoveDown => {
-                self.gallery.move_down(self.paths.len());
-                self.needs_redraw = true;
+                if self.mode == Mode::Viewer {
+                    let next = if self.current_index + 1 >= self.paths.len() {
+                        0
+                    } else {
+                        self.current_index + 1
+                    };
+                    self.navigate_to(next);
+                } else {
+                    self.gallery.move_down(self.paths.len());
+                    self.needs_redraw = true;
+                }
             }
             Action::GalleryFirst => {
                 self.gallery.go_first();

@@ -64,25 +64,25 @@ impl Viewer {
 
     pub fn pan_left(&mut self) {
         if self.zoom > 1.0 {
-            self.pan_x -= PAN_STEP;
+            self.pan_x += PAN_STEP;
         }
     }
 
     pub fn pan_right(&mut self) {
         if self.zoom > 1.0 {
-            self.pan_x += PAN_STEP;
+            self.pan_x -= PAN_STEP;
         }
     }
 
     pub fn pan_up(&mut self) {
         if self.zoom > 1.0 {
-            self.pan_y -= PAN_STEP;
+            self.pan_y += PAN_STEP;
         }
     }
 
     pub fn pan_down(&mut self) {
         if self.zoom > 1.0 {
-            self.pan_y += PAN_STEP;
+            self.pan_y -= PAN_STEP;
         }
     }
 

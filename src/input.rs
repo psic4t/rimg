@@ -56,12 +56,12 @@ pub fn map_key(event: &KeyEvent, mode: Mode) -> Option<Action> {
     }
 
     match mode {
-        Mode::Viewer => map_viewer_key(sym),
+        Mode::Viewer => map_viewer_key(sym, event.ctrl),
         Mode::Gallery => map_gallery_key(sym),
     }
 }
 
-fn map_viewer_key(sym: u32) -> Option<Action> {
+fn map_viewer_key(sym: u32, ctrl: bool) -> Option<Action> {
     match sym {
         keysyms::n => Some(Action::NextImage),
         keysyms::p => Some(Action::PrevImage),
@@ -70,10 +70,34 @@ fn map_viewer_key(sym: u32) -> Option<Action> {
         keysyms::plus | keysyms::equal => Some(Action::ZoomIn),
         keysyms::minus => Some(Action::ZoomOut),
         keysyms::_0 => Some(Action::ZoomReset),
-        keysyms::h => Some(Action::PanLeft),
-        keysyms::l => Some(Action::PanRight),
-        keysyms::k => Some(Action::PanUp),
-        keysyms::j => Some(Action::PanDown),
+        keysyms::h => {
+            if ctrl {
+                Some(Action::PanLeft)
+            } else {
+                Some(Action::MoveLeft)
+            }
+        }
+        keysyms::l => {
+            if ctrl {
+                Some(Action::PanRight)
+            } else {
+                Some(Action::MoveRight)
+            }
+        }
+        keysyms::k => {
+            if ctrl {
+                Some(Action::PanUp)
+            } else {
+                Some(Action::MoveUp)
+            }
+        }
+        keysyms::j => {
+            if ctrl {
+                Some(Action::PanDown)
+            } else {
+                Some(Action::MoveDown)
+            }
+        }
         keysyms::space => Some(Action::NextImage),
         keysyms::BackSpace => Some(Action::PrevImage),
         _ => None,
