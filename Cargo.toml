@@ -1,0 +1,26 @@
+cargo-features = ["panic-immediate-abort"]
+
+[package]
+name = "rimg"
+version = "0.1.0"
+authors = ["psic4t <psic4t@data.haus>"]
+edition = "2021"
+description = "Minimal Wayland image viewer with vim keybindings"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-scanner = "0.31"
+xkbcommon-dl = "0.4"
+rustix = { version = "0.38", features = ["fs", "mm", "event"] }
+turbojpeg = { version = "1.4", default-features = false, features = ["pkg-config"] }
+libwebp-sys2 = "0.2"
+bitflags = "2"
+log = { version = "0.4", features = ["max_level_off"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = "symbols"
+panic = "immediate-abort"
+codegen-units = 1
