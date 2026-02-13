@@ -352,6 +352,29 @@ impl App {
         self.needs_redraw = false;
     }
 
+    /// Rotate the current image in the cache (clockwise if `cw`, counterclockwise otherwise).
+    fn rotate_current_image(&mut self, cw: bool) {
+        if let Some(loaded) = self.image_cache.remove(&self.current_index) {
+            let rotate_fn = if cw {
+                image_loader::rotate_90
+            } else {
+                image_loader::rotate_270
+            };
+            let rotated = match loaded {
+                LoadedImage::Static(img) => LoadedImage::Static(rotate_fn(img)),
+                LoadedImage::Animated { frames } => LoadedImage::Animated {
+                    frames: frames
+                        .into_iter()
+                        .map(|(img, dur)| (rotate_fn(img), dur))
+                        .collect(),
+                },
+            };
+            self.image_cache.insert(self.current_index, rotated);
+            self.viewer.zoom_reset();
+            self.needs_redraw = true;
+        }
+    }
+
     /// Handle an action. Returns true if the app should quit.
     fn handle_action(&mut self, action: Action) -> bool {
         match action {
@@ -439,6 +462,12 @@ impl App {
             }
             Action::Fullscreen => {
                 self.state.toggle_fullscreen();
+            }
+            Action::RotateCW => {
+                self.rotate_current_image(true);
+            }
+            Action::RotateCCW => {
+                self.rotate_current_image(false);
             }
             Action::MoveLeft => {
                 if self.mode == Mode::Viewer {

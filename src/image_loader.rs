@@ -800,7 +800,7 @@ fn apply_orientation(img: RgbaImage, orientation: u32) -> RgbaImage {
     }
 }
 
-fn rotate_90(img: RgbaImage) -> RgbaImage {
+pub fn rotate_90(img: RgbaImage) -> RgbaImage {
     let (w, h) = (img.width, img.height);
     let mut out = RgbaImage::new(h, w);
     for y in 0..h {
@@ -828,7 +828,7 @@ fn rotate_180(img: RgbaImage) -> RgbaImage {
     out
 }
 
-fn rotate_270(img: RgbaImage) -> RgbaImage {
+pub fn rotate_270(img: RgbaImage) -> RgbaImage {
     let (w, h) = (img.width, img.height);
     let mut out = RgbaImage::new(h, w);
     for y in 0..h {
