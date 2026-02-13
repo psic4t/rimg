@@ -70,28 +70,28 @@ fn map_viewer_key(sym: u32, ctrl: bool) -> Option<Action> {
         keysyms::plus | keysyms::equal => Some(Action::ZoomIn),
         keysyms::minus => Some(Action::ZoomOut),
         keysyms::_0 => Some(Action::ZoomReset),
-        keysyms::h => {
+        keysyms::h | keysyms::Left => {
             if ctrl {
                 Some(Action::PanLeft)
             } else {
                 Some(Action::MoveLeft)
             }
         }
-        keysyms::l => {
+        keysyms::l | keysyms::Right => {
             if ctrl {
                 Some(Action::PanRight)
             } else {
                 Some(Action::MoveRight)
             }
         }
-        keysyms::k => {
+        keysyms::k | keysyms::Up => {
             if ctrl {
                 Some(Action::PanUp)
             } else {
                 Some(Action::MoveUp)
             }
         }
-        keysyms::j => {
+        keysyms::j | keysyms::Down => {
             if ctrl {
                 Some(Action::PanDown)
             } else {
@@ -106,10 +106,10 @@ fn map_viewer_key(sym: u32, ctrl: bool) -> Option<Action> {
 
 fn map_gallery_key(sym: u32) -> Option<Action> {
     match sym {
-        keysyms::h => Some(Action::MoveLeft),
-        keysyms::l => Some(Action::MoveRight),
-        keysyms::k => Some(Action::MoveUp),
-        keysyms::j => Some(Action::MoveDown),
+        keysyms::h | keysyms::Left => Some(Action::MoveLeft),
+        keysyms::l | keysyms::Right => Some(Action::MoveRight),
+        keysyms::k | keysyms::Up => Some(Action::MoveUp),
+        keysyms::j | keysyms::Down => Some(Action::MoveDown),
         keysyms::g => Some(Action::GalleryFirst),
         keysyms::G => Some(Action::GalleryLast),
         _ => None,

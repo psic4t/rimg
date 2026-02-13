@@ -24,8 +24,8 @@ fn main() {
         eprintln!("  p/Backspace  Previous image");
         eprintln!("  g/G          First/last image");
         eprintln!("  +/-/0        Zoom in/out/reset");
-        eprintln!("  h/j/k/l      Navigate images (prev/next/up/down)");
-        eprintln!("  Ctrl+h/j/k/l Pan when zoomed");
+        eprintln!("  h/j/k/l      Navigate (also arrow keys)");
+        eprintln!("  Ctrl+h/j/k/l Pan when zoomed (also Ctrl+arrows)");
         eprintln!("  Enter        Toggle gallery mode");
         eprintln!("  q/Escape     Quit");
         process::exit(1);
