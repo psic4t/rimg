@@ -595,6 +595,90 @@ fn load_gif(path: &Path) -> Result<LoadedImage, String> {
 }
 
 // ============================================================
+// Thumbnail-optimized loading (JPEG DCT scaling)
+// ============================================================
+
+/// Load an image and return a thumbnail-sized RgbaImage.
+/// For JPEG: uses turbojpeg DCT scaling to decode at reduced resolution.
+/// For other formats: decodes at full resolution and resizes.
+pub fn load_image_thumbnail(path: &Path, thumb_size: u32) -> Result<RgbaImage, String> {
+    let ext = ascii_lower(path.extension().and_then(|e| e.to_str()).unwrap_or(""));
+
+    match ext.as_str() {
+        "jpg" | "jpeg" => load_jpeg_thumbnail(path, thumb_size),
+        _ => {
+            // Non-JPEG: full decode + resize
+            let loaded = load_image(path)?;
+            let frame = loaded.first_frame();
+            Ok(crate::render::generate_thumbnail(frame, thumb_size))
+        }
+    }
+}
+
+/// Load a JPEG at reduced resolution using DCT scaling, then resize to thumbnail.
+fn load_jpeg_thumbnail(path: &Path, thumb_size: u32) -> Result<RgbaImage, String> {
+    let data = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+
+    let mut decompressor = turbojpeg::Decompressor::new()
+        .map_err(|e| format!("Failed to create decompressor: {}", e))?;
+
+    let header = decompressor
+        .read_header(&data)
+        .map_err(|e| format!("Failed to read JPEG header {}: {}", path.display(), e))?;
+
+    // Pick the best DCT scaling factor: smallest where both scaled dims >= thumb_size
+    let scaling_factors = [
+        turbojpeg::ScalingFactor::ONE_EIGHTH,
+        turbojpeg::ScalingFactor::ONE_QUARTER,
+        turbojpeg::ScalingFactor::ONE_HALF,
+        turbojpeg::ScalingFactor::ONE,
+    ];
+
+    let mut best = turbojpeg::ScalingFactor::ONE;
+    for &sf in &scaling_factors {
+        let sw = sf.scale(header.width);
+        let sh = sf.scale(header.height);
+        if sw >= thumb_size as usize && sh >= thumb_size as usize {
+            best = sf;
+            break;
+        }
+    }
+
+    if best != turbojpeg::ScalingFactor::ONE {
+        decompressor
+            .set_scaling_factor(best)
+            .map_err(|e| format!("Failed to set scaling factor: {}", e))?;
+    }
+
+    let scaled_header = header.scaled(best);
+    let w = scaled_header.width;
+    let h = scaled_header.height;
+    let pitch = w * 4;
+
+    let mut image = turbojpeg::Image {
+        pixels: vec![0u8; h * pitch],
+        width: w,
+        pitch,
+        height: h,
+        format: turbojpeg::PixelFormat::RGBA,
+    };
+
+    decompressor
+        .decompress(&data, image.as_deref_mut())
+        .map_err(|e| format!("Failed to decode JPEG {}: {}", path.display(), e))?;
+
+    let mut img = RgbaImage::from_raw(w as u32, h as u32, image.pixels)
+        .ok_or_else(|| "JPEG pixel buffer size mismatch".to_string())?;
+
+    // Apply EXIF orientation
+    if let Some(orientation) = read_exif_orientation(&data) {
+        img = apply_orientation(img, orientation);
+    }
+
+    Ok(crate::render::generate_thumbnail(&img, thumb_size))
+}
+
+// ============================================================
 // Manual EXIF orientation parser
 // ============================================================
 

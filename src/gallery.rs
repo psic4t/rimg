@@ -1,8 +1,10 @@
 use crate::image_loader;
 use crate::image_loader::RgbaImage;
 use crate::render;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 
 /// Thumbnail size in pixels.
 const THUMB_SIZE: u32 = 200;
@@ -26,15 +28,43 @@ pub struct Gallery {
     thumbnails: HashMap<usize, RgbaImage>,
     /// Number of columns in the current layout.
     cols: usize,
+    /// Sender to dispatch thumbnail generation requests to the worker.
+    work_tx: mpsc::Sender<Vec<(usize, PathBuf)>>,
+    /// Receiver for completed thumbnails from the worker.
+    result_rx: mpsc::Receiver<(usize, RgbaImage)>,
+    /// Indices sent to worker but not yet received.
+    pending: HashSet<usize>,
 }
 
 impl Gallery {
     pub fn new() -> Self {
+        // Channel: main -> worker (batches of work)
+        let (work_tx, work_rx) = mpsc::channel::<Vec<(usize, PathBuf)>>();
+        // Channel: worker -> main (completed thumbnails)
+        let (result_tx, result_rx) = mpsc::channel::<(usize, RgbaImage)>();
+
+        // Spawn background worker thread
+        thread::spawn(move || {
+            while let Ok(batch) = work_rx.recv() {
+                for (index, path) in batch {
+                    if let Ok(thumb) = image_loader::load_image_thumbnail(&path, THUMB_SIZE) {
+                        if result_tx.send((index, thumb)).is_err() {
+                            return; // Main thread dropped receiver, exit
+                        }
+                    }
+                }
+            }
+            // work_rx disconnected, exit cleanly
+        });
+
         Self {
             selected: 0,
             scroll_y: 0,
             thumbnails: HashMap::new(),
             cols: 1,
+            work_tx,
+            result_rx,
+            pending: HashSet::new(),
         }
     }
 
@@ -102,6 +132,23 @@ impl Gallery {
         }
     }
 
+    /// Returns true if there are thumbnail requests pending in the worker.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Poll for completed thumbnails from the background worker.
+    /// Returns true if any new thumbnails were received.
+    pub fn poll_thumbnails(&mut self) -> bool {
+        let mut received = false;
+        while let Ok((index, thumb)) = self.result_rx.try_recv() {
+            self.thumbnails.insert(index, thumb);
+            self.pending.remove(&index);
+            received = true;
+        }
+        received
+    }
+
     /// Ensure the selected thumbnail is visible by adjusting scroll.
     fn ensure_visible(&mut self, win_h: u32) {
         let row = self.selected / self.cols;
@@ -143,15 +190,16 @@ impl Gallery {
         let load_start = first_visible.saturating_sub(self.cols);
         let load_end = (last_visible + self.cols).min(total);
 
-        // Generate thumbnails for visible + buffer zone
+        // Dispatch missing thumbnails to background worker
+        let mut batch = Vec::new();
         for i in load_start..load_end {
-            if !self.thumbnails.contains_key(&i) {
-                if let Ok(loaded) = image_loader::load_image(&paths[i]) {
-                    let frame = loaded.first_frame();
-                    let thumb = render::generate_thumbnail(frame, THUMB_SIZE);
-                    self.thumbnails.insert(i, thumb);
-                }
+            if !self.thumbnails.contains_key(&i) && !self.pending.contains(&i) {
+                batch.push((i, paths[i].clone()));
+                self.pending.insert(i);
             }
+        }
+        if !batch.is_empty() {
+            let _ = self.work_tx.send(batch);
         }
 
         // Draw thumbnails

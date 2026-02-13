@@ -77,7 +77,7 @@ impl App {
             // Flush outgoing messages
             let _ = self.conn.flush();
 
-            // Calculate poll timeout based on GIF animation
+            // Calculate poll timeout based on GIF animation or pending thumbnails
             let timeout_ms = if self.mode == Mode::Viewer {
                 if let Some(deadline) = self.viewer.next_frame_deadline() {
                     let now = Instant::now();
@@ -89,6 +89,8 @@ impl App {
                 } else {
                     -1 // Block indefinitely
                 }
+            } else if self.mode == Mode::Gallery && self.gallery.has_pending() {
+                16 // Poll at ~60fps while thumbnails are being generated
             } else {
                 -1
             };
@@ -134,6 +136,13 @@ impl App {
                             self.redraw();
                         }
                     }
+                }
+            }
+
+            // Poll for completed thumbnails from background worker
+            if self.mode == Mode::Gallery {
+                if self.gallery.poll_thumbnails() {
+                    self.needs_redraw = true;
                 }
             }
 
