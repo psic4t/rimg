@@ -1,3 +1,4 @@
+use crate::font;
 use crate::image_loader::LoadedImage;
 use crate::image_loader::RgbaImage;
 use crate::render;
@@ -22,6 +23,10 @@ pub struct Viewer {
     // Animation state
     pub current_frame: usize,
     pub next_frame_time: Option<Instant>,
+
+    // EXIF overlay state
+    show_exif: bool,
+    exif_lines: Vec<String>,
 }
 
 impl Viewer {
@@ -33,6 +38,8 @@ impl Viewer {
             fit_scale: 1.0,
             current_frame: 0,
             next_frame_time: None,
+            show_exif: false,
+            exif_lines: Vec::new(),
         }
     }
 
@@ -42,6 +49,29 @@ impl Viewer {
         self.pan_y = 0;
         self.current_frame = 0;
         self.next_frame_time = None;
+        self.show_exif = false;
+    }
+
+    pub fn toggle_exif(&mut self) {
+        self.show_exif = !self.show_exif;
+    }
+
+    pub fn hide_exif(&mut self) {
+        self.show_exif = false;
+    }
+
+    pub fn is_exif_visible(&self) -> bool {
+        self.show_exif
+    }
+
+    pub fn set_exif_data(&mut self, tags: Vec<(String, String)>) {
+        self.exif_lines = if tags.is_empty() {
+            vec!["No EXIF data".to_string()]
+        } else {
+            tags.into_iter()
+                .map(|(label, value)| format!("{}: {}", label, value))
+                .collect()
+        };
     }
 
     pub fn zoom_in(&mut self) {
@@ -163,6 +193,47 @@ impl Viewer {
         let status_text = status::format_status(path, src_w, src_h, index, total);
         status::draw_status_bar(&mut buf, win_w, win_h, &status_text);
 
+        // Draw EXIF overlay
+        if self.show_exif && !self.exif_lines.is_empty() {
+            self.draw_exif_overlay(&mut buf, win_w, win_h);
+        }
+
         buf
+    }
+
+    fn draw_exif_overlay(&self, buf: &mut [u32], win_w: u32, win_h: u32) {
+        let padding: u32 = 8;
+        let margin: u32 = 10;
+        let line_h = font::GLYPH_H + 2; // 2px spacing between lines
+        let radius: u32 = 6;
+
+        // Calculate overlay dimensions
+        let max_line_len = self.exif_lines.iter().map(|l| l.len()).max().unwrap_or(0) as u32;
+        let overlay_w = max_line_len * font::GLYPH_W + padding * 2;
+        let overlay_h = self.exif_lines.len() as u32 * line_h + padding * 2 - 2; // -2: no trailing spacing
+
+        // Position at top-right
+        let overlay_x = win_w.saturating_sub(overlay_w + margin);
+        let overlay_y = margin;
+
+        // Clamp to window
+        let overlay_w = overlay_w.min(win_w.saturating_sub(margin));
+        let overlay_h = overlay_h.min(win_h.saturating_sub(margin * 2));
+
+        // Draw rounded dark overlay (same style as status bar: alpha 160)
+        render::draw_overlay_rounded(
+            buf, win_w, overlay_x, overlay_y, overlay_w, overlay_h, 160, radius,
+        );
+
+        // Draw text lines (same color as status bar: 0x00DDDDDD)
+        let text_x = overlay_x + padding;
+        let mut text_y = overlay_y + padding;
+        for line in &self.exif_lines {
+            if text_y + font::GLYPH_H > overlay_y + overlay_h {
+                break;
+            }
+            font::draw_string(buf, win_w, win_h, line, text_x, text_y, 0x00DDDDDD);
+            text_y += line_h;
+        }
     }
 }

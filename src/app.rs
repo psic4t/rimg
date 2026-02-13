@@ -76,6 +76,7 @@ impl App {
         if let Some(loaded) = self.image_cache.get(&self.current_index) {
             self.viewer.start_animation(loaded);
         }
+        self.load_exif_for_current();
         self.update_title();
 
         // Main event loop using poll
@@ -310,8 +311,27 @@ impl App {
             self.viewer.start_animation(loaded);
         }
 
+        self.load_exif_for_current();
         self.update_title();
         self.needs_redraw = true;
+    }
+
+    fn load_exif_for_current(&mut self) {
+        if let Some(path) = self.paths.get(self.current_index) {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext == "jpg" || ext == "jpeg" {
+                if let Ok(data) = std::fs::read(path) {
+                    let tags = image_loader::read_exif_tags(&data);
+                    self.viewer.set_exif_data(tags);
+                    return;
+                }
+            }
+            self.viewer.set_exif_data(Vec::new());
+        }
     }
 
     fn update_title(&self) {
@@ -390,7 +410,11 @@ impl App {
                     if let Some(loaded) = self.image_cache.get(&self.current_index) {
                         self.viewer.start_animation(loaded);
                     }
+                    self.load_exif_for_current();
                     self.update_title();
+                    self.needs_redraw = true;
+                } else if self.viewer.is_exif_visible() {
+                    self.viewer.hide_exif();
                     self.needs_redraw = true;
                 } else {
                     return true;
@@ -468,6 +492,10 @@ impl App {
             }
             Action::RotateCCW => {
                 self.rotate_current_image(false);
+            }
+            Action::ToggleExif => {
+                self.viewer.toggle_exif();
+                self.needs_redraw = true;
             }
             Action::MoveLeft => {
                 if self.mode == Mode::Viewer {

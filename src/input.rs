@@ -24,6 +24,7 @@ pub enum Action {
     Fullscreen,
     RotateCW,
     RotateCCW,
+    ToggleExif,
 
     // Gallery actions
     MoveLeft,
@@ -101,6 +102,7 @@ fn map_viewer_key(sym: u32, ctrl: bool) -> Option<Action> {
                 Some(Action::MoveDown)
             }
         }
+        keysyms::e => Some(Action::ToggleExif),
         keysyms::f => Some(Action::Fullscreen),
         keysyms::r => Some(Action::RotateCW),
         keysyms::R => Some(Action::RotateCCW),

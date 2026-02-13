@@ -856,6 +856,623 @@ fn flip_h(img: RgbaImage) -> RgbaImage {
     out
 }
 
+// ============================================================
+// Full EXIF tag reader
+// ============================================================
+
+/// Read all available EXIF tags from raw JPEG data.
+/// Returns a list of (label, value) pairs for display.
+pub fn read_exif_tags(data: &[u8]) -> Vec<(String, String)> {
+    // JPEG must start with SOI (0xFFD8)
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return Vec::new();
+    }
+
+    let mut pos = 2;
+    while pos + 4 < data.len() {
+        if data[pos] != 0xFF {
+            return Vec::new();
+        }
+        let marker = data[pos + 1];
+        let seg_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        if marker == 0xE1 {
+            let seg_start = pos + 4;
+            if seg_start + 6 > data.len() {
+                return Vec::new();
+            }
+            if &data[seg_start..seg_start + 6] != b"Exif\0\0" {
+                pos += 2 + seg_len;
+                continue;
+            }
+            let tiff_start = seg_start + 6;
+            return parse_all_exif_tags(data, tiff_start);
+        }
+        if marker == 0xDA {
+            break;
+        }
+        pos += 2 + seg_len;
+    }
+    Vec::new()
+}
+
+fn parse_all_exif_tags(data: &[u8], tiff_offset: usize) -> Vec<(String, String)> {
+    if tiff_offset + 8 > data.len() {
+        return Vec::new();
+    }
+
+    let d = &data[tiff_offset..];
+    let le = match (d[0], d[1]) {
+        (b'I', b'I') => true,
+        (b'M', b'M') => false,
+        _ => return Vec::new(),
+    };
+
+    let read_u16 = |off: usize| -> Option<u16> {
+        if off + 2 > d.len() {
+            return None;
+        }
+        Some(if le {
+            u16::from_le_bytes([d[off], d[off + 1]])
+        } else {
+            u16::from_be_bytes([d[off], d[off + 1]])
+        })
+    };
+
+    let read_u32 = |off: usize| -> Option<u32> {
+        if off + 4 > d.len() {
+            return None;
+        }
+        Some(if le {
+            u32::from_le_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
+        } else {
+            u32::from_be_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
+        })
+    };
+
+    if read_u16(2) != Some(42) {
+        return Vec::new();
+    }
+
+    let ifd_offset = match read_u32(4) {
+        Some(v) => v as usize,
+        None => return Vec::new(),
+    };
+
+    let mut tags = Vec::new();
+    let mut exif_ifd_offset: Option<usize> = None;
+    let mut gps_ifd_offset: Option<usize> = None;
+
+    // Parse IFD0
+    parse_ifd_tags(
+        d,
+        ifd_offset,
+        le,
+        &IFD0_TAGS,
+        &mut tags,
+        &mut exif_ifd_offset,
+        &mut gps_ifd_offset,
+    );
+
+    // Parse EXIF sub-IFD
+    if let Some(offset) = exif_ifd_offset {
+        parse_ifd_tags(d, offset, le, &EXIF_TAGS, &mut tags, &mut None, &mut None);
+    }
+
+    // Parse GPS IFD
+    if let Some(offset) = gps_ifd_offset {
+        parse_gps_tags(d, offset, le, &mut tags);
+    }
+
+    tags
+}
+
+/// Known IFD0 tags
+const IFD0_TAGS: &[(u16, &str)] = &[
+    (0x010F, "Make"),
+    (0x0110, "Model"),
+    (0x0112, "Orientation"),
+    (0x011A, "X Resolution"),
+    (0x011B, "Y Resolution"),
+    (0x0131, "Software"),
+    (0x0132, "Date/Time"),
+    (0x013B, "Artist"),
+    (0x8298, "Copyright"),
+];
+
+/// Known EXIF sub-IFD tags
+const EXIF_TAGS: &[(u16, &str)] = &[
+    (0x829A, "Exposure Time"),
+    (0x829D, "F-Number"),
+    (0x8827, "ISO"),
+    (0x9003, "Date Original"),
+    (0x9004, "Date Digitized"),
+    (0x9204, "Exposure Bias"),
+    (0x9207, "Metering Mode"),
+    (0x9209, "Flash"),
+    (0x920A, "Focal Length"),
+    (0xA001, "Color Space"),
+    (0xA002, "Width"),
+    (0xA003, "Height"),
+    (0xA402, "Exposure Mode"),
+    (0xA403, "White Balance"),
+    (0xA434, "Lens Model"),
+];
+
+/// TIFF data type sizes: 0=unused, 1=BYTE, 2=ASCII, 3=SHORT, 4=LONG, 5=RATIONAL,
+/// 6=SBYTE, 7=UNDEFINED, 8=SSHORT, 9=SLONG, 10=SRATIONAL
+const TYPE_SIZES: &[usize] = &[0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8];
+
+fn parse_ifd_tags(
+    d: &[u8],
+    ifd_offset: usize,
+    le: bool,
+    known_tags: &[(u16, &str)],
+    tags: &mut Vec<(String, String)>,
+    exif_ifd: &mut Option<usize>,
+    gps_ifd: &mut Option<usize>,
+) {
+    let read_u16 = |off: usize| -> Option<u16> {
+        if off + 2 > d.len() {
+            return None;
+        }
+        Some(if le {
+            u16::from_le_bytes([d[off], d[off + 1]])
+        } else {
+            u16::from_be_bytes([d[off], d[off + 1]])
+        })
+    };
+
+    let read_u32 = |off: usize| -> Option<u32> {
+        if off + 4 > d.len() {
+            return None;
+        }
+        Some(if le {
+            u32::from_le_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
+        } else {
+            u32::from_be_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
+        })
+    };
+
+    if ifd_offset + 2 > d.len() {
+        return;
+    }
+    let entry_count = match read_u16(ifd_offset) {
+        Some(v) => v as usize,
+        None => return,
+    };
+    let entries_start = ifd_offset + 2;
+
+    for i in 0..entry_count {
+        let entry_off = entries_start + i * 12;
+        if entry_off + 12 > d.len() {
+            break;
+        }
+        let tag = match read_u16(entry_off) {
+            Some(v) => v,
+            None => continue,
+        };
+        let dtype = match read_u16(entry_off + 2) {
+            Some(v) => v as usize,
+            None => continue,
+        };
+        let count = match read_u32(entry_off + 4) {
+            Some(v) => v as usize,
+            None => continue,
+        };
+
+        // EXIF sub-IFD pointer
+        if tag == 0x8769 {
+            if let Some(offset) = read_u32(entry_off + 8) {
+                *exif_ifd = Some(offset as usize);
+            }
+            continue;
+        }
+        // GPS IFD pointer
+        if tag == 0x8825 {
+            if let Some(offset) = read_u32(entry_off + 8) {
+                *gps_ifd = Some(offset as usize);
+            }
+            continue;
+        }
+
+        // Check if this is a known tag
+        let label = match known_tags.iter().find(|(t, _)| *t == tag) {
+            Some((_, name)) => *name,
+            None => continue,
+        };
+
+        let value = read_tag_value(d, entry_off + 8, dtype, count, le, tag);
+        if let Some(v) = value {
+            if !v.is_empty() {
+                tags.push((label.to_string(), v));
+            }
+        }
+    }
+}
+
+fn read_tag_value(
+    d: &[u8],
+    value_off: usize,
+    dtype: usize,
+    count: usize,
+    le: bool,
+    tag: u16,
+) -> Option<String> {
+    let read_u16_at = |off: usize| -> Option<u16> {
+        if off + 2 > d.len() {
+            return None;
+        }
+        Some(if le {
+            u16::from_le_bytes([d[off], d[off + 1]])
+        } else {
+            u16::from_be_bytes([d[off], d[off + 1]])
+        })
+    };
+
+    let read_u32_at = |off: usize| -> Option<u32> {
+        if off + 4 > d.len() {
+            return None;
+        }
+        Some(if le {
+            u32::from_le_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
+        } else {
+            u32::from_be_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
+        })
+    };
+
+    let read_i32_at = |off: usize| -> Option<i32> {
+        if off + 4 > d.len() {
+            return None;
+        }
+        Some(if le {
+            i32::from_le_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
+        } else {
+            i32::from_be_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
+        })
+    };
+
+    // Determine if value is inline or at an offset
+    let type_size = if dtype < TYPE_SIZES.len() {
+        TYPE_SIZES[dtype]
+    } else {
+        return None;
+    };
+    let total_bytes = type_size * count;
+    let data_off = if total_bytes <= 4 {
+        value_off // inline
+    } else {
+        read_u32_at(value_off)? as usize // offset into TIFF data
+    };
+
+    match dtype {
+        // ASCII
+        2 => {
+            if data_off + count > d.len() {
+                return None;
+            }
+            let bytes = &d[data_off..data_off + count];
+            // Trim trailing null bytes
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            let s: String = bytes[..end]
+                .iter()
+                .map(|&b| {
+                    if b >= 0x20 && b <= 0x7E {
+                        b as char
+                    } else {
+                        '?'
+                    }
+                })
+                .collect();
+            Some(s)
+        }
+        // SHORT
+        3 => {
+            let val = read_u16_at(data_off)? as u32;
+            Some(format_tag_short(tag, val))
+        }
+        // LONG
+        4 => {
+            let val = read_u32_at(data_off)?;
+            Some(format!("{}", val))
+        }
+        // RATIONAL (unsigned)
+        5 => {
+            let num = read_u32_at(data_off)?;
+            let den = read_u32_at(data_off + 4)?;
+            Some(format_rational(tag, num, den))
+        }
+        // SRATIONAL (signed)
+        10 => {
+            let num = read_i32_at(data_off)?;
+            let den = read_i32_at(data_off + 4)?;
+            Some(format_srational(tag, num, den))
+        }
+        _ => None,
+    }
+}
+
+fn format_tag_short(tag: u16, val: u32) -> String {
+    match tag {
+        // Orientation
+        0x0112 => match val {
+            1 => "Normal".to_string(),
+            2 => "Flipped horizontally".to_string(),
+            3 => "Rotated 180".to_string(),
+            4 => "Flipped vertically".to_string(),
+            5 => "Transposed".to_string(),
+            6 => "Rotated 90 CW".to_string(),
+            7 => "Transversed".to_string(),
+            8 => "Rotated 270 CW".to_string(),
+            _ => format!("{}", val),
+        },
+        // MeteringMode
+        0x9207 => match val {
+            0 => "Unknown".to_string(),
+            1 => "Average".to_string(),
+            2 => "Center-weighted".to_string(),
+            3 => "Spot".to_string(),
+            4 => "Multi-spot".to_string(),
+            5 => "Pattern".to_string(),
+            6 => "Partial".to_string(),
+            _ => format!("{}", val),
+        },
+        // Flash
+        0x9209 => {
+            if val & 1 == 0 {
+                "No flash".to_string()
+            } else {
+                "Flash fired".to_string()
+            }
+        }
+        // ColorSpace
+        0xA001 => match val {
+            1 => "sRGB".to_string(),
+            0xFFFF => "Uncalibrated".to_string(),
+            _ => format!("{}", val),
+        },
+        // ExposureMode
+        0xA402 => match val {
+            0 => "Auto".to_string(),
+            1 => "Manual".to_string(),
+            2 => "Auto bracket".to_string(),
+            _ => format!("{}", val),
+        },
+        // WhiteBalance
+        0xA403 => match val {
+            0 => "Auto".to_string(),
+            1 => "Manual".to_string(),
+            _ => format!("{}", val),
+        },
+        _ => format!("{}", val),
+    }
+}
+
+fn format_rational(tag: u16, num: u32, den: u32) -> String {
+    if den == 0 {
+        return "0".to_string();
+    }
+    match tag {
+        // ExposureTime: show as fraction if < 1s
+        0x829A => {
+            if num == 0 {
+                "0s".to_string()
+            } else if num >= den {
+                let secs = num as f64 / den as f64;
+                format!("{}s", format_decimal(secs))
+            } else {
+                // Simplify fraction
+                let ratio = den / num;
+                format!("1/{}s", ratio)
+            }
+        }
+        // FNumber
+        0x829D => {
+            let f = num as f64 / den as f64;
+            format!("f/{}", format_decimal(f))
+        }
+        // FocalLength
+        0x920A => {
+            let fl = num as f64 / den as f64;
+            format!("{}mm", format_decimal(fl))
+        }
+        // XResolution, YResolution
+        0x011A | 0x011B => {
+            let dpi = num / den;
+            format!("{} dpi", dpi)
+        }
+        _ => {
+            if den == 1 {
+                format!("{}", num)
+            } else {
+                format!("{}/{}", num, den)
+            }
+        }
+    }
+}
+
+fn format_srational(tag: u16, num: i32, den: i32) -> String {
+    if den == 0 {
+        return "0".to_string();
+    }
+    match tag {
+        // ExposureBias
+        0x9204 => {
+            let ev = num as f64 / den as f64;
+            if ev >= 0.0 {
+                format!("+{} EV", format_decimal(ev))
+            } else {
+                format!("{} EV", format_decimal(ev))
+            }
+        }
+        _ => {
+            if den == 1 {
+                format!("{}", num)
+            } else {
+                format!("{}/{}", num, den)
+            }
+        }
+    }
+}
+
+fn format_decimal(val: f64) -> String {
+    if (val - val.round()).abs() < 0.01 {
+        format!("{:.0}", val)
+    } else if (val * 10.0 - (val * 10.0).round()).abs() < 0.01 {
+        format!("{:.1}", val)
+    } else {
+        format!("{:.2}", val)
+    }
+}
+
+fn parse_gps_tags(d: &[u8], ifd_offset: usize, le: bool, tags: &mut Vec<(String, String)>) {
+    let read_u16 = |off: usize| -> Option<u16> {
+        if off + 2 > d.len() {
+            return None;
+        }
+        Some(if le {
+            u16::from_le_bytes([d[off], d[off + 1]])
+        } else {
+            u16::from_be_bytes([d[off], d[off + 1]])
+        })
+    };
+
+    let read_u32 = |off: usize| -> Option<u32> {
+        if off + 4 > d.len() {
+            return None;
+        }
+        Some(if le {
+            u32::from_le_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
+        } else {
+            u32::from_be_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
+        })
+    };
+
+    if ifd_offset + 2 > d.len() {
+        return;
+    }
+    let entry_count = match read_u16(ifd_offset) {
+        Some(v) => v as usize,
+        None => return,
+    };
+    let entries_start = ifd_offset + 2;
+
+    let mut lat_ref: Option<u8> = None;
+    let mut lon_ref: Option<u8> = None;
+    let mut lat_vals: Option<(f64, f64, f64)> = None;
+    let mut lon_vals: Option<(f64, f64, f64)> = None;
+    let mut alt: Option<f64> = None;
+
+    for i in 0..entry_count {
+        let entry_off = entries_start + i * 12;
+        if entry_off + 12 > d.len() {
+            break;
+        }
+        let tag = match read_u16(entry_off) {
+            Some(v) => v,
+            None => continue,
+        };
+        let dtype = match read_u16(entry_off + 2) {
+            Some(v) => v as usize,
+            None => continue,
+        };
+        let count = match read_u32(entry_off + 4) {
+            Some(v) => v as usize,
+            None => continue,
+        };
+
+        let type_size = if dtype < TYPE_SIZES.len() {
+            TYPE_SIZES[dtype]
+        } else {
+            continue;
+        };
+        let total_bytes = type_size * count;
+        let data_off = if total_bytes <= 4 {
+            entry_off + 8
+        } else {
+            match read_u32(entry_off + 8) {
+                Some(v) => v as usize,
+                None => continue,
+            }
+        };
+
+        match tag {
+            // GPSLatitudeRef
+            0x0001 => {
+                if data_off < d.len() {
+                    lat_ref = Some(d[data_off]);
+                }
+            }
+            // GPSLatitude (3 RATIONALs: degrees, minutes, seconds)
+            0x0002 => {
+                if dtype == 5 && count == 3 {
+                    lat_vals = read_gps_coord(d, data_off, le);
+                }
+            }
+            // GPSLongitudeRef
+            0x0003 => {
+                if data_off < d.len() {
+                    lon_ref = Some(d[data_off]);
+                }
+            }
+            // GPSLongitude
+            0x0004 => {
+                if dtype == 5 && count == 3 {
+                    lon_vals = read_gps_coord(d, data_off, le);
+                }
+            }
+            // GPSAltitude
+            0x0006 => {
+                if dtype == 5 {
+                    let num = read_u32(data_off).unwrap_or(0) as f64;
+                    let den = read_u32(data_off + 4).unwrap_or(1).max(1) as f64;
+                    alt = Some(num / den);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Format GPS coordinates
+    if let (Some((deg, min, sec)), Some(r)) = (lat_vals, lat_ref) {
+        let decimal = deg + min / 60.0 + sec / 3600.0;
+        let sign = if r == b'S' { -1.0 } else { 1.0 };
+        let lat = decimal * sign;
+
+        if let (Some((ldeg, lmin, lsec)), Some(lr)) = (lon_vals, lon_ref) {
+            let ldecimal = ldeg + lmin / 60.0 + lsec / 3600.0;
+            let lsign = if lr == b'W' { -1.0 } else { 1.0 };
+            let lon = ldecimal * lsign;
+            tags.push(("GPS".to_string(), format!("{:.6}, {:.6}", lat, lon)));
+        }
+    }
+
+    if let Some(altitude) = alt {
+        tags.push(("Altitude".to_string(), format!("{:.1}m", altitude)));
+    }
+}
+
+fn read_gps_coord(d: &[u8], off: usize, le: bool) -> Option<(f64, f64, f64)> {
+    let read_u32 = |o: usize| -> Option<u32> {
+        if o + 4 > d.len() {
+            return None;
+        }
+        Some(if le {
+            u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+        } else {
+            u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+        })
+    };
+
+    let deg_n = read_u32(off)? as f64;
+    let deg_d = read_u32(off + 4)?.max(1) as f64;
+    let min_n = read_u32(off + 8)? as f64;
+    let min_d = read_u32(off + 12)?.max(1) as f64;
+    let sec_n = read_u32(off + 16)? as f64;
+    let sec_d = read_u32(off + 20)?.max(1) as f64;
+
+    Some((deg_n / deg_d, min_n / min_d, sec_n / sec_d))
+}
+
 fn flip_v(img: RgbaImage) -> RgbaImage {
     let (w, h) = (img.width, img.height);
     let mut out = RgbaImage::new(w, h);

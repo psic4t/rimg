@@ -228,6 +228,66 @@ pub fn draw_overlay(buf: &mut [u32], buf_w: u32, x: u32, y: u32, w: u32, h: u32,
     }
 }
 
+/// Draw a semi-transparent dark overlay with rounded corners.
+/// Same blending as `draw_overlay` but skips pixels outside the corner radius.
+pub fn draw_overlay_rounded(
+    buf: &mut [u32],
+    buf_w: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    alpha: u32,
+    radius: u32,
+) {
+    let r = radius.min(w / 2).min(h / 2);
+    let r_sq = (r * r) as i64;
+
+    for row in y..y.saturating_add(h) {
+        if row >= buf.len() as u32 / buf_w.max(1) {
+            break;
+        }
+        let ry = row - y; // row within the rect
+        for col in x..x.saturating_add(w) {
+            if col >= buf_w {
+                break;
+            }
+            let rx = col - x; // col within the rect
+
+            // Check if pixel is in a corner region and outside the radius
+            if r > 0 {
+                let in_corner = (rx < r && ry < r)
+                    || (rx >= w - r && ry < r)
+                    || (rx < r && ry >= h - r)
+                    || (rx >= w - r && ry >= h - r);
+                if in_corner {
+                    // Distance from the nearest corner's circle center
+                    let cx = if rx < r { r - 1 } else { w - r };
+                    let cy = if ry < r { r - 1 } else { h - r };
+                    let dx = rx as i64 - cx as i64;
+                    let dy = ry as i64 - cy as i64;
+                    if dx * dx + dy * dy > r_sq {
+                        continue; // Outside rounded corner
+                    }
+                }
+            }
+
+            let idx = (row * buf_w + col) as usize;
+            if idx >= buf.len() {
+                break;
+            }
+            let existing = buf[idx];
+            let bg_r = (existing >> 16) & 0xFF;
+            let bg_g = (existing >> 8) & 0xFF;
+            let bg_b = existing & 0xFF;
+            let out_r = (bg_r * (255 - alpha)) / 255;
+            let out_g = (bg_g * (255 - alpha)) / 255;
+            let out_b = (bg_b * (255 - alpha)) / 255;
+            buf[idx] = (out_r << 16) | (out_g << 8) | out_b;
+        }
+    }
+}
+
 /// Blit an RGBA thumbnail onto an XRGB buffer at position (dx, dy), centered within
 /// a cell of (cell_w, cell_h).
 pub fn blit_thumbnail(
