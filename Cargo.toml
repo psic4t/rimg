@@ -4,7 +4,7 @@ version = "1.0.0"
 authors = ["psic4t <psic4t@data.haus>"]
 edition = "2021"
 description = "Minimal Wayland image viewer with vim keybindings"
-license = "GPL-3.0"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 wayland-client = "0.31"

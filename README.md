@@ -28,7 +28,7 @@ wlr-layer-shell protocol.
 
 ### Build
 
-- Rust nightly toolchain
+- Rust stable toolchain
 - pkg-config
 
 ### Runtime libraries
@@ -64,7 +64,7 @@ pacman -S wayland libxkbcommon libjpeg-turbo libpng giflib libwebp libtiff librs
 cargo build --release
 ```
 
-The binary is placed at `target/x86_64-unknown-linux-gnu/release/rimg`.
+The binary is placed at `target/release/rimg`.
 
 ## Installation
 
