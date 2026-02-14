@@ -3,9 +3,9 @@
 Minimal Wayland image viewer with vim keybindings.
 
 rimg is a fast, lightweight image viewer for Wayland with no GUI toolkit
-dependencies. It supports JPEG, PNG, GIF (animated), and WebP formats. It can
-also set wallpapers on wlroots-based compositors via the wlr-layer-shell
-protocol.
+dependencies. It supports JPEG, PNG, GIF (animated), WebP, BMP, TIFF, and SVG
+formats. It can also set wallpapers on wlroots-based compositors via the
+wlr-layer-shell protocol.
 
 ## Features
 
@@ -35,17 +35,20 @@ protocol.
 - libpng16
 - libgif
 - libwebp
+- libtiff
+- librsvg-2 (SVG rendering)
+- libcairo (used by librsvg)
 
 On Debian/Ubuntu:
 
 ```sh
-apt install libwayland-dev libxkbcommon-dev libturbojpeg0-dev libpng-dev libgif-dev libwebp-dev
+apt install libwayland-dev libxkbcommon-dev libturbojpeg0-dev libpng-dev libgif-dev libwebp-dev libtiff-dev librsvg2-dev libcairo2-dev
 ```
 
 On Arch Linux:
 
 ```sh
-pacman -S wayland libxkbcommon libjpeg-turbo libpng giflib libwebp
+pacman -S wayland libxkbcommon libjpeg-turbo libpng giflib libwebp libtiff librsvg cairo
 ```
 
 ## Building

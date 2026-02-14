@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Supported image extensions (lowercase).
-const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp"];
+const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif", "svg",
+];
 
 /// Simple RGBA image buffer.
 #[derive(Clone)]
@@ -110,6 +112,9 @@ pub fn load_image(path: &Path) -> Result<LoadedImage, String> {
         "png" => load_png(path),
         "webp" => load_webp(path),
         "gif" => load_gif(path),
+        "bmp" => load_bmp(path),
+        "tiff" | "tif" => load_tiff(path),
+        "svg" => load_svg(path),
         _ => Err(format!("Unsupported format: {}", ext)),
     }
 }
@@ -591,6 +596,358 @@ fn load_gif(path: &Path) -> Result<LoadedImage, String> {
         }
 
         Ok(LoadedImage::Animated { frames })
+    }
+}
+
+// ============================================================
+// BMP (manual parsing - simple format)
+// ============================================================
+
+fn load_bmp(path: &Path) -> Result<LoadedImage, String> {
+    let data = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+
+    if data.len() < 54 {
+        return Err("File too small to be BMP".to_string());
+    }
+
+    if &data[0..2] != b"BM" {
+        return Err("Not a BMP file".to_string());
+    }
+
+    let data_offset = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+    let width = i32::from_le_bytes([data[18], data[19], data[20], data[21]]);
+    let height = i32::from_le_bytes([data[22], data[23], data[24], data[25]]);
+    let bits_per_pixel = u16::from_le_bytes([data[28], data[29]]);
+
+    if width <= 0 || height == 0 {
+        return Err("Invalid BMP dimensions".to_string());
+    }
+
+    let (w, h) = (width as u32, height.unsigned_abs() as u32);
+    let row_size = ((w * bits_per_pixel as u32 + 31) / 32) * 4;
+    let expected_size = data_offset + (row_size * h) as usize;
+
+    if data.len() < expected_size {
+        return Err("BMP file truncated".to_string());
+    }
+
+    let mut rgba_data = vec![0u8; (w * h * 4) as usize];
+
+    match bits_per_pixel {
+        24 => {
+            for y in 0..h {
+                for x in 0..w {
+                    let src_row = if height > 0 {
+                        (h - 1 - y) as usize
+                    } else {
+                        y as usize
+                    };
+                    let src_idx = data_offset + (src_row * row_size as usize) + (x as usize * 3);
+                    let dst = ((y * w + x) * 4) as usize;
+                    rgba_data[dst] = data[src_idx + 2];
+                    rgba_data[dst + 1] = data[src_idx + 1];
+                    rgba_data[dst + 2] = data[src_idx];
+                    rgba_data[dst + 3] = 255;
+                }
+            }
+        }
+        32 => {
+            for y in 0..h {
+                for x in 0..w {
+                    let src_row = if height > 0 {
+                        (h - 1 - y) as usize
+                    } else {
+                        y as usize
+                    };
+                    let src_idx = data_offset + (src_row * row_size as usize) + (x as usize * 4);
+                    let dst = ((y * w + x) * 4) as usize;
+                    rgba_data[dst] = data[src_idx + 2];
+                    rgba_data[dst + 1] = data[src_idx + 1];
+                    rgba_data[dst + 2] = data[src_idx];
+                    rgba_data[dst + 3] = data[src_idx + 3];
+                }
+            }
+        }
+        1 | 4 | 8 => {
+            return Err(format!("Unsupported BMP bit depth: {}", bits_per_pixel));
+        }
+        _ => {
+            return Err(format!("Unknown BMP bit depth: {}", bits_per_pixel));
+        }
+    }
+
+    let img = RgbaImage::from_raw(w, h, rgba_data)
+        .ok_or_else(|| "BMP pixel buffer size mismatch".to_string())?;
+
+    Ok(LoadedImage::Static(img))
+}
+
+// ============================================================
+// TIFF via system libtiff
+// ============================================================
+
+#[allow(non_camel_case_types)]
+mod libtiff {
+    use std::os::raw::{c_char, c_int, c_uint, c_void};
+
+    pub type TIFF = c_void;
+
+    pub const TIFFTAG_IMAGEWIDTH: c_uint = 256;
+    pub const TIFFTAG_IMAGELENGTH: c_uint = 257;
+    pub const ORIENTATION_TOPLEFT: c_int = 1;
+
+    #[link(name = "tiff")]
+    extern "C" {
+        pub fn TIFFOpen(filename: *const c_char, mode: *const c_char) -> *mut TIFF;
+        pub fn TIFFClose(tif: *mut TIFF);
+        pub fn TIFFGetField(tif: *mut TIFF, tag: c_uint, ...) -> c_int;
+        pub fn TIFFReadRGBAImageOriented(
+            tif: *mut TIFF,
+            width: c_uint,
+            height: c_uint,
+            raster: *mut u32,
+            orientation: c_int,
+            stop: c_int,
+        ) -> c_int;
+    }
+}
+
+fn load_tiff(path: &Path) -> Result<LoadedImage, String> {
+    let c_path = CString::new(path.to_str().ok_or_else(|| "Invalid path".to_string())?)
+        .map_err(|_| "Path contains null byte".to_string())?;
+    let mode = b"r\0".as_ptr() as *const c_char;
+
+    unsafe {
+        let tif = libtiff::TIFFOpen(c_path.as_ptr(), mode);
+        if tif.is_null() {
+            return Err(format!("Failed to open TIFF {}", path.display()));
+        }
+
+        let mut w: c_uint = 0;
+        let mut h: c_uint = 0;
+        if libtiff::TIFFGetField(tif, libtiff::TIFFTAG_IMAGEWIDTH, &mut w as *mut c_uint) == 0
+            || libtiff::TIFFGetField(tif, libtiff::TIFFTAG_IMAGELENGTH, &mut h as *mut c_uint) == 0
+        {
+            libtiff::TIFFClose(tif);
+            return Err(format!("Failed to get TIFF dimensions {}", path.display()));
+        }
+
+        let npixels = (w as usize) * (h as usize);
+        let mut raster: Vec<u32> = vec![0u32; npixels];
+
+        let ok = libtiff::TIFFReadRGBAImageOriented(
+            tif,
+            w,
+            h,
+            raster.as_mut_ptr(),
+            libtiff::ORIENTATION_TOPLEFT,
+            0,
+        );
+        libtiff::TIFFClose(tif);
+
+        if ok == 0 {
+            return Err(format!("Failed to decode TIFF {}", path.display()));
+        }
+
+        // libtiff returns ABGR packed u32 (R in lowest byte). Convert to RGBA bytes.
+        let mut rgba = Vec::with_capacity(npixels * 4);
+        for &pixel in &raster {
+            rgba.push((pixel & 0xFF) as u8);
+            rgba.push(((pixel >> 8) & 0xFF) as u8);
+            rgba.push(((pixel >> 16) & 0xFF) as u8);
+            rgba.push(((pixel >> 24) & 0xFF) as u8);
+        }
+
+        let img = RgbaImage::from_raw(w as u32, h as u32, rgba)
+            .ok_or_else(|| "TIFF pixel buffer size mismatch".to_string())?;
+
+        Ok(LoadedImage::Static(img))
+    }
+}
+
+// ============================================================
+// SVG via system librsvg + cairo
+// ============================================================
+
+#[allow(non_camel_case_types)]
+mod librsvg {
+    use std::os::raw::{c_char, c_int, c_uchar, c_void};
+
+    pub type RsvgHandle = c_void;
+    pub type cairo_surface_t = c_void;
+    pub type cairo_t = c_void;
+    pub type GError = c_void;
+
+    pub const CAIRO_FORMAT_ARGB32: c_int = 0;
+
+    #[repr(C)]
+    pub struct RsvgRectangle {
+        pub x: f64,
+        pub y: f64,
+        pub width: f64,
+        pub height: f64,
+    }
+
+    #[link(name = "rsvg-2")]
+    extern "C" {
+        pub fn rsvg_handle_new_from_file(
+            file_name: *const c_char,
+            error: *mut *mut GError,
+        ) -> *mut RsvgHandle;
+        pub fn rsvg_handle_get_intrinsic_size_in_pixels(
+            handle: *mut RsvgHandle,
+            out_width: *mut f64,
+            out_height: *mut f64,
+        ) -> c_int;
+        pub fn rsvg_handle_render_document(
+            handle: *mut RsvgHandle,
+            cr: *mut cairo_t,
+            viewport: *const RsvgRectangle,
+            error: *mut *mut GError,
+        ) -> c_int;
+        pub fn rsvg_handle_set_dpi(handle: *mut RsvgHandle, dpi: f64);
+    }
+
+    #[link(name = "gobject-2.0")]
+    extern "C" {
+        pub fn g_object_unref(object: *mut c_void);
+    }
+
+    #[link(name = "glib-2.0")]
+    extern "C" {
+        pub fn g_error_free(error: *mut GError);
+    }
+
+    #[link(name = "cairo")]
+    extern "C" {
+        pub fn cairo_image_surface_create(
+            format: c_int,
+            width: c_int,
+            height: c_int,
+        ) -> *mut cairo_surface_t;
+        pub fn cairo_create(target: *mut cairo_surface_t) -> *mut cairo_t;
+        pub fn cairo_destroy(cr: *mut cairo_t);
+        pub fn cairo_surface_destroy(surface: *mut cairo_surface_t);
+        pub fn cairo_surface_flush(surface: *mut cairo_surface_t);
+        pub fn cairo_image_surface_get_data(surface: *mut cairo_surface_t) -> *mut c_uchar;
+        pub fn cairo_image_surface_get_stride(surface: *mut cairo_surface_t) -> c_int;
+    }
+}
+
+fn load_svg(path: &Path) -> Result<LoadedImage, String> {
+    let c_path = CString::new(path.to_str().ok_or_else(|| "Invalid path".to_string())?)
+        .map_err(|_| "Path contains null byte".to_string())?;
+
+    unsafe {
+        // Load SVG
+        let mut error: *mut librsvg::GError = std::ptr::null_mut();
+        let handle = librsvg::rsvg_handle_new_from_file(c_path.as_ptr(), &mut error);
+        if handle.is_null() {
+            if !error.is_null() {
+                librsvg::g_error_free(error);
+            }
+            return Err(format!("Failed to load SVG {}", path.display()));
+        }
+
+        librsvg::rsvg_handle_set_dpi(handle, 96.0);
+
+        // Get intrinsic dimensions; fall back to 1024x1024
+        let mut w: f64 = 0.0;
+        let mut h: f64 = 0.0;
+        if librsvg::rsvg_handle_get_intrinsic_size_in_pixels(handle, &mut w, &mut h) == 0
+            || w <= 0.0
+            || h <= 0.0
+        {
+            w = 1024.0;
+            h = 1024.0;
+        }
+
+        let pw = w.ceil() as c_int;
+        let ph = h.ceil() as c_int;
+
+        // Create cairo image surface
+        let surface = librsvg::cairo_image_surface_create(librsvg::CAIRO_FORMAT_ARGB32, pw, ph);
+        if surface.is_null() {
+            librsvg::g_object_unref(handle);
+            return Err(format!(
+                "Failed to create cairo surface for {}",
+                path.display()
+            ));
+        }
+
+        let cr = librsvg::cairo_create(surface);
+        if cr.is_null() {
+            librsvg::cairo_surface_destroy(surface);
+            librsvg::g_object_unref(handle);
+            return Err(format!(
+                "Failed to create cairo context for {}",
+                path.display()
+            ));
+        }
+
+        // Render SVG to surface
+        let viewport = librsvg::RsvgRectangle {
+            x: 0.0,
+            y: 0.0,
+            width: w,
+            height: h,
+        };
+        let mut render_error: *mut librsvg::GError = std::ptr::null_mut();
+        let ok = librsvg::rsvg_handle_render_document(handle, cr, &viewport, &mut render_error);
+
+        if ok == 0 {
+            if !render_error.is_null() {
+                librsvg::g_error_free(render_error);
+            }
+            librsvg::cairo_destroy(cr);
+            librsvg::cairo_surface_destroy(surface);
+            librsvg::g_object_unref(handle);
+            return Err(format!("Failed to render SVG {}", path.display()));
+        }
+
+        librsvg::cairo_surface_flush(surface);
+
+        // Read pixel data from surface
+        let data_ptr = librsvg::cairo_image_surface_get_data(surface);
+        let stride = librsvg::cairo_image_surface_get_stride(surface) as usize;
+        let width = pw as u32;
+        let height = ph as u32;
+
+        // Convert from cairo premultiplied ARGB32 (native endian) to straight RGBA.
+        // On little-endian x86_64, bytes in memory are: B, G, R, A.
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            let row = data_ptr.add(y as usize * stride);
+            for x in 0..width {
+                let px = row.add(x as usize * 4);
+                let b = *px;
+                let g = *px.add(1);
+                let r = *px.add(2);
+                let a = *px.add(3);
+
+                // Un-premultiply alpha
+                if a == 0 {
+                    rgba.extend_from_slice(&[0, 0, 0, 0]);
+                } else if a == 255 {
+                    rgba.extend_from_slice(&[r, g, b, a]);
+                } else {
+                    let aa = a as u16;
+                    rgba.push(((r as u16 * 255 + aa / 2) / aa).min(255) as u8);
+                    rgba.push(((g as u16 * 255 + aa / 2) / aa).min(255) as u8);
+                    rgba.push(((b as u16 * 255 + aa / 2) / aa).min(255) as u8);
+                    rgba.push(a);
+                }
+            }
+        }
+
+        librsvg::cairo_destroy(cr);
+        librsvg::cairo_surface_destroy(surface);
+        librsvg::g_object_unref(handle);
+
+        let img = RgbaImage::from_raw(width, height, rgba)
+            .ok_or_else(|| "SVG pixel buffer size mismatch".to_string())?;
+
+        Ok(LoadedImage::Static(img))
     }
 }
 

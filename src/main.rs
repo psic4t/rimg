@@ -14,7 +14,7 @@ use std::process;
 
 fn print_help() {
     println!("Usage: rimg [options] <file>... | rimg [options] <directory>");
-    println!("  Supported formats: jpg, jpeg, png, gif, webp");
+    println!("  Supported formats: jpg, jpeg, png, gif, webp, bmp, tiff, tif, svg");
     println!();
     println!("Options:");
     println!("  -h, --help   Show this help message");
