@@ -33,11 +33,54 @@ Decode GIF images (including animated) by calling the system libgif shared libra
 - **WHEN** libgif cannot decode the file
 - **THEN** an error string is returned and the file is skipped without crashing
 
+### Requirement: TIFF decoding via system libtiff
+
+Decode TIFF images by calling the system libtiff shared library through FFI.
+
+#### Scenario: Load a TIFF image
+- **WHEN** a TIFF file is opened
+- **THEN** it is decoded using `TIFFOpen` + `TIFFReadRGBAImageOriented` with top-left orientation
+- **AND** libtiff's ABGR packed u32 pixels are converted to RGBA byte order
+- **AND** the result is an `RgbaImage`
+
+#### Scenario: TIFF decode error
+- **WHEN** libtiff cannot open or decode the file
+- **THEN** an error string is returned and the file is skipped without crashing
+
+### Requirement: SVG decoding via system librsvg and cairo
+
+Rasterize SVG images by calling the system librsvg-2 and cairo shared libraries through FFI. SVGs are rendered to a cairo image surface and converted to RGBA pixels.
+
+#### Scenario: Load an SVG with intrinsic pixel dimensions
+- **WHEN** an SVG file with `width` and `height` attributes (in resolvable units) is opened
+- **THEN** `rsvg_handle_new_from_file` loads and parses the SVG
+- **AND** `rsvg_handle_get_intrinsic_size_in_pixels` determines the rasterization size
+- **AND** the DPI is set to 96 via `rsvg_handle_set_dpi`
+- **AND** a cairo ARGB32 image surface is created at those dimensions
+- **AND** `rsvg_handle_render_document` renders the SVG to the surface
+- **AND** cairo's premultiplied BGRA pixel data is converted to straight RGBA
+
+#### Scenario: Load an SVG without intrinsic dimensions
+- **WHEN** an SVG file has only a `viewBox` or percentage-based width/height
+- **THEN** `rsvg_handle_get_intrinsic_size_in_pixels` returns false
+- **AND** the SVG is rasterized at a default size of 1024x1024 pixels
+
+#### Scenario: SVG decode error
+- **WHEN** librsvg cannot parse or render the SVG
+- **THEN** an error string is returned and the file is skipped without crashing
+
+#### Scenario: Premultiplied alpha conversion
+- **WHEN** the cairo surface data is read after rendering
+- **THEN** each pixel is converted from premultiplied ARGB32 (native byte order: BGRA on little-endian) to straight RGBA
+- **AND** fully transparent pixels (alpha=0) are set to all zeros
+- **AND** fully opaque pixels (alpha=255) are reordered without division
+- **AND** partially transparent pixels are un-premultiplied with rounding
+
 ### Requirement: Link-time binding to system libraries
 
-The FFI bindings use `#[link(name = "png16")]` and `#[link(name = "gif")]` for link-time resolution.
+The FFI bindings use `#[link(name = "...")]` for link-time resolution of all system image decoder libraries.
 
 #### Scenario: Build with system libraries
 - **WHEN** the project is built
-- **THEN** the linker resolves libpng16 and libgif symbols against the system .so files
-- **AND** the resulting binary has dynamic dependencies on `libpng16.so` and `libgif.so`
+- **THEN** the linker resolves symbols against system .so files for libpng16, libgif, libtiff, librsvg-2, libcairo, libgobject-2.0, and libglib-2.0
+- **AND** the resulting binary has dynamic dependencies on these shared libraries

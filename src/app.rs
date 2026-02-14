@@ -1,6 +1,6 @@
 use crate::gallery::Gallery;
 use crate::image_loader::{self, LoadedImage};
-use crate::input::{Action, Mode};
+use crate::input::{Action, Mode, PanDirection};
 use crate::viewer::Viewer;
 use crate::wayland::{WaylandEvent, WaylandState};
 use std::collections::HashMap;
@@ -441,6 +441,9 @@ impl App {
                 } else if self.viewer.is_exif_visible() {
                     self.viewer.hide_exif();
                     self.needs_redraw = true;
+                } else if self.viewer.is_zoomed() {
+                    self.viewer.zoom_reset();
+                    self.needs_redraw = true;
                 } else {
                     return true;
                 }
@@ -502,8 +505,31 @@ impl App {
                 self.needs_redraw = true;
             }
             Action::PanStart(dir) => {
-                self.viewer.pan_start(dir);
-                // No needs_redraw here — update_pan() in the event loop handles it
+                if self.viewer.is_zoomed() {
+                    self.viewer.pan_start(dir);
+                    // No needs_redraw here — update_pan() in the event loop handles it
+                } else {
+                    // When not zoomed, h/l/Left/Right navigate between images
+                    match dir {
+                        PanDirection::Left => {
+                            let prev = if self.current_index == 0 {
+                                self.paths.len().saturating_sub(1)
+                            } else {
+                                self.current_index - 1
+                            };
+                            self.navigate_to(prev);
+                        }
+                        PanDirection::Right => {
+                            let next = if self.current_index + 1 >= self.paths.len() {
+                                0
+                            } else {
+                                self.current_index + 1
+                            };
+                            self.navigate_to(next);
+                        }
+                        _ => {} // Up/Down ignored when not zoomed
+                    }
+                }
             }
             Action::PanStop(dir) => {
                 self.viewer.pan_stop(dir);
@@ -522,56 +548,20 @@ impl App {
                 self.needs_redraw = true;
             }
             Action::MoveLeft => {
-                if self.mode == Mode::Viewer {
-                    let prev = if self.current_index == 0 {
-                        self.paths.len().saturating_sub(1)
-                    } else {
-                        self.current_index - 1
-                    };
-                    self.navigate_to(prev);
-                } else {
-                    self.gallery.move_left(self.paths.len());
-                    self.needs_redraw = true;
-                }
+                self.gallery.move_left(self.paths.len());
+                self.needs_redraw = true;
             }
             Action::MoveRight => {
-                if self.mode == Mode::Viewer {
-                    let next = if self.current_index + 1 >= self.paths.len() {
-                        0
-                    } else {
-                        self.current_index + 1
-                    };
-                    self.navigate_to(next);
-                } else {
-                    self.gallery.move_right(self.paths.len());
-                    self.needs_redraw = true;
-                }
+                self.gallery.move_right(self.paths.len());
+                self.needs_redraw = true;
             }
             Action::MoveUp => {
-                if self.mode == Mode::Viewer {
-                    let prev = if self.current_index == 0 {
-                        self.paths.len().saturating_sub(1)
-                    } else {
-                        self.current_index - 1
-                    };
-                    self.navigate_to(prev);
-                } else {
-                    self.gallery.move_up(self.paths.len());
-                    self.needs_redraw = true;
-                }
+                self.gallery.move_up(self.paths.len());
+                self.needs_redraw = true;
             }
             Action::MoveDown => {
-                if self.mode == Mode::Viewer {
-                    let next = if self.current_index + 1 >= self.paths.len() {
-                        0
-                    } else {
-                        self.current_index + 1
-                    };
-                    self.navigate_to(next);
-                } else {
-                    self.gallery.move_down(self.paths.len());
-                    self.needs_redraw = true;
-                }
+                self.gallery.move_down(self.paths.len());
+                self.needs_redraw = true;
             }
             Action::GalleryFirst => {
                 self.gallery.go_first();

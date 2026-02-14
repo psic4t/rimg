@@ -2,7 +2,7 @@ use xkbcommon_dl::keysyms;
 
 use crate::wayland::KeyEvent;
 
-// Evdev keycodes for vim pan keys (layout-independent, unaffected by Ctrl)
+// Evdev keycodes (layout-independent)
 const KEY_H: u32 = 35;
 const KEY_J: u32 = 36;
 const KEY_K: u32 = 37;
@@ -81,41 +81,26 @@ pub fn map_key(event: &KeyEvent, mode: Mode) -> Option<Action> {
     }
 
     match mode {
-        Mode::Viewer => map_viewer_key(event.keycode, sym, event.ctrl),
+        Mode::Viewer => map_viewer_key(event.keycode, sym, event.ctrl, event.shift),
         Mode::Gallery => map_gallery_key(sym),
     }
 }
 
-fn map_viewer_key(keycode: u32, sym: u32, ctrl: bool) -> Option<Action> {
-    // When Ctrl is held, map hjkl/arrows to pan.
-    // For h/j/k/l we use keycode because xkb transforms them into control characters.
-    // For arrows we use keysym (stable with Ctrl held).
-    if ctrl {
-        let pan = match keycode {
-            KEY_H => Some(PanDirection::Left),
-            KEY_J => Some(PanDirection::Down),
-            KEY_K => Some(PanDirection::Up),
-            KEY_L => Some(PanDirection::Right),
-            _ => match sym {
-                keysyms::Left => Some(PanDirection::Left),
-                keysyms::Right => Some(PanDirection::Right),
-                keysyms::Up => Some(PanDirection::Up),
-                keysyms::Down => Some(PanDirection::Down),
-                _ => None,
-            },
-        };
-        if let Some(dir) = pan {
-            return Some(Action::PanStart(dir));
-        }
-        if keycode == KEY_W {
-            return Some(Action::FitToWindow);
-        }
-        if keycode == KEY_0 {
-            return Some(Action::ActualSize);
-        }
+fn map_viewer_key(keycode: u32, sym: u32, ctrl: bool, shift: bool) -> Option<Action> {
+    if ctrl && keycode == KEY_0 {
+        return Some(Action::ActualSize);
     }
 
+    if shift && keycode == KEY_W {
+        return Some(Action::FitToWindow);
+    }
+
+    // h/j/k/l and arrow keys pan directly (no Ctrl required).
     match sym {
+        keysyms::h | keysyms::Left => Some(Action::PanStart(PanDirection::Left)),
+        keysyms::l | keysyms::Right => Some(Action::PanStart(PanDirection::Right)),
+        keysyms::k | keysyms::Up => Some(Action::PanStart(PanDirection::Up)),
+        keysyms::j | keysyms::Down => Some(Action::PanStart(PanDirection::Down)),
         keysyms::n => Some(Action::NextImage),
         keysyms::p => Some(Action::PrevImage),
         keysyms::g => Some(Action::FirstImage),
@@ -123,10 +108,6 @@ fn map_viewer_key(keycode: u32, sym: u32, ctrl: bool) -> Option<Action> {
         keysyms::plus | keysyms::equal => Some(Action::ZoomIn),
         keysyms::minus => Some(Action::ZoomOut),
         keysyms::_0 => Some(Action::ZoomReset),
-        keysyms::h | keysyms::Left => Some(Action::MoveLeft),
-        keysyms::l | keysyms::Right => Some(Action::MoveRight),
-        keysyms::k | keysyms::Up => Some(Action::MoveUp),
-        keysyms::j | keysyms::Down => Some(Action::MoveDown),
         keysyms::e => Some(Action::ToggleExif),
         keysyms::f => Some(Action::Fullscreen),
         keysyms::r => Some(Action::RotateCW),
@@ -138,8 +119,6 @@ fn map_viewer_key(keycode: u32, sym: u32, ctrl: bool) -> Option<Action> {
 }
 
 /// Map key releases in viewer mode — only pan stop events.
-/// Uses keycode for h/j/k/l (since keysym changes with Ctrl held)
-/// and keysym for arrow keys (stable regardless of modifiers).
 fn map_viewer_key_release(keycode: u32, sym: u32) -> Option<Action> {
     match keycode {
         KEY_H => Some(Action::PanStop(PanDirection::Left)),

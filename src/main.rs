@@ -14,7 +14,7 @@ use std::process;
 
 fn print_help() {
     println!("Usage: rimg [options] <file>... | rimg [options] <directory>");
-    println!("  Supported formats: jpg, jpeg, png, gif, webp");
+    println!("  Supported formats: jpg, jpeg, png, gif, webp, bmp, tiff, tif, svg");
     println!();
     println!("Options:");
     println!("  -h, --help   Show this help message");
@@ -25,9 +25,8 @@ fn print_help() {
     println!("  p/Backspace  Previous image");
     println!("  g/G          First/last image");
     println!("  +/-/0        Zoom in/out/reset");
-    println!("  h/j/k/l      Navigate (also arrow keys)");
-    println!("  Ctrl+h/j/k/l Pan when zoomed (also Ctrl+arrows)");
-    println!("  Ctrl+w       Toggle fit-to-window for small images");
+    println!("  h/j/k/l      Pan when zoomed, h/l navigate otherwise (also arrows)");
+    println!("  Shift+w      Toggle fit-to-window for small images");
     println!("  Ctrl+0       Display at actual size (1:1 pixels)");
     println!("  r/R          Rotate clockwise/counterclockwise");
     println!("  Enter        Toggle gallery mode");

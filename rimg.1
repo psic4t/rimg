@@ -12,7 +12,7 @@ rimg \- minimal Wayland image viewer with vim keybindings
 .SH DESCRIPTION
 .B rimg
 is a fast, lightweight image viewer for Wayland.
-It supports JPEG, PNG, GIF (animated), and WebP formats.
+It supports JPEG, PNG, GIF (animated), WebP, BMP, TIFF, and SVG formats.
 It features vim-style keybindings, a thumbnail gallery mode,
 zoom and pan, image rotation, and EXIF metadata display.
 .PP
@@ -60,12 +60,9 @@ Zoom out.
 Reset zoom (fit-to-window).
 .TP
 .BR h / j / k / l ", " "arrow keys"
-Navigate between images.
+Pan when zoomed, h/l navigate between images otherwise.
 .TP
-.BR Ctrl+h / j / k / l ", " "Ctrl+arrow keys"
-Pan when zoomed.
-.TP
-.B Ctrl+w
+.B Shift+w
 Toggle fit-to-window for small images.
 .TP
 .B Ctrl+0
@@ -108,7 +105,7 @@ Quit.
 .B Escape
 Return to viewer mode.
 .SH SUPPORTED FORMATS
-JPEG, PNG, GIF (animated), WebP.
+JPEG, PNG, GIF (animated), WebP, BMP, TIFF, SVG.
 .PP
 EXIF orientation is automatically applied when loading JPEG images.
 .SH ENVIRONMENT
