@@ -1,0 +1,157 @@
+.TH RIMG 1 "2026-02-14" "rimg 0.1.0" "User Commands"
+.SH NAME
+rimg \- minimal Wayland image viewer with vim keybindings
+.SH SYNOPSIS
+.B rimg
+.RI [ options ]
+.IR file ...
+.br
+.B rimg
+.RI [ options ]
+.IR directory
+.SH DESCRIPTION
+.B rimg
+is a fast, lightweight image viewer for Wayland.
+It supports JPEG, PNG, GIF (animated), and WebP formats.
+It features vim-style keybindings, a thumbnail gallery mode,
+zoom and pan, image rotation, and EXIF metadata display.
+.PP
+When given a directory,
+.B rimg
+recursively scans it for supported image files.
+Files are sorted by filename.
+.PP
+With the
+.B \-w
+flag,
+.B rimg
+sets the given image as the desktop wallpaper on wlroots-based compositors
+(sway, Hyprland, dwl, etc.) using the wlr-layer-shell protocol.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Show help message and exit.
+.TP
+.B \-w
+Set image as wallpaper using the wlr-layer-shell protocol.
+The image is scaled to fill each output with center cropping.
+.SH KEYBINDINGS
+.SS Viewer Mode
+.TP
+.BR n ", " Space
+Next image.
+.TP
+.BR p ", " Backspace
+Previous image.
+.TP
+.B g
+First image.
+.TP
+.B G
+Last image.
+.TP
+.BR + ", " =
+Zoom in.
+.TP
+.B \-
+Zoom out.
+.TP
+.B 0
+Reset zoom (fit-to-window).
+.TP
+.BR h / j / k / l ", " "arrow keys"
+Navigate between images.
+.TP
+.BR Ctrl+h / j / k / l ", " "Ctrl+arrow keys"
+Pan when zoomed.
+.TP
+.B Ctrl+w
+Toggle fit-to-window for small images.
+.TP
+.B Ctrl+0
+Display at actual size (1:1 pixels).
+.TP
+.B r
+Rotate clockwise 90 degrees.
+.TP
+.B R
+Rotate counterclockwise 90 degrees.
+.TP
+.B e
+Toggle EXIF info overlay (JPEG only).
+.TP
+.B f
+Toggle fullscreen.
+.TP
+.B Enter
+Enter gallery mode.
+.TP
+.BR q ", " Escape
+Quit.
+.SS Gallery Mode
+.TP
+.BR h / j / k / l ", " "arrow keys"
+Navigate thumbnail grid.
+.TP
+.B g
+First image.
+.TP
+.B G
+Last image.
+.TP
+.B Enter
+Open selected image in viewer.
+.TP
+.B q
+Quit.
+.TP
+.B Escape
+Return to viewer mode.
+.SH SUPPORTED FORMATS
+JPEG, PNG, GIF (animated), WebP.
+.PP
+EXIF orientation is automatically applied when loading JPEG images.
+.SH ENVIRONMENT
+.B rimg
+requires a running Wayland compositor.
+The
+.B WAYLAND_DISPLAY
+environment variable must be set.
+.PP
+Wallpaper mode
+.RB ( \-w )
+requires a wlroots-based compositor that supports the
+wlr-layer-shell protocol.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Error (no files specified, no supported files found, or connection failure).
+.SH EXAMPLES
+View a single image:
+.PP
+.RS
+.B rimg photo.jpg
+.RE
+.PP
+View all images in a directory:
+.PP
+.RS
+.B rimg ~/Pictures/
+.RE
+.PP
+View multiple files:
+.PP
+.RS
+.B rimg photo1.jpg photo2.png image3.gif
+.RE
+.PP
+Set wallpaper:
+.PP
+.RS
+.B rimg \-w wallpaper.jpg
+.RE
+.SH AUTHOR
+psic4t <psic4t@data.haus>
