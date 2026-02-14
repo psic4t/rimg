@@ -12,12 +12,6 @@ const THUMB_SIZE: u32 = 200;
 const GAP: u32 = 10;
 /// Padding from window edges.
 const PADDING: u32 = 10;
-/// Selection border width.
-const BORDER_W: u32 = 3;
-/// Selection border color (white-ish).
-const SELECTION_COLOR: u32 = 0x00CCCCCC;
-/// Selection overlay alpha (0-255). Lower = more subtle.
-const SELECTION_ALPHA: u32 = 50;
 /// Selection corner radius (matches exif info overlay).
 const SELECTION_RADIUS: u32 = 6;
 /// Placeholder color (dark gray).
@@ -220,22 +214,32 @@ impl Gallery {
 
             let dy = y.max(0) as u32;
 
-            // Draw selection border or placeholder background
+            // Draw selection background with border (same style as EXIF info overlay)
             if i == self.selected {
-                // Selection: draw rounded border
-                let bx = x.saturating_sub(BORDER_W);
-                let by = dy.saturating_sub(if y >= 0 { BORDER_W } else { 0 });
-                let bw = THUMB_SIZE + BORDER_W * 2;
-                let bh = THUMB_SIZE + BORDER_W * 2;
-                render::fill_rect_rounded_blend(
+                let bx = x.saturating_sub(2);
+                let by = dy.saturating_sub(2);
+                let bw = THUMB_SIZE + 4;
+                let bh = THUMB_SIZE + 4;
+                // Draw dark overlay first (same as EXIF info overlay)
+                render::draw_overlay_rounded(
                     &mut buf,
                     win_w,
                     bx,
                     by,
                     bw,
                     bh,
-                    SELECTION_COLOR,
-                    SELECTION_ALPHA,
+                    160,
+                    SELECTION_RADIUS,
+                );
+                // Draw border on top
+                render::fill_rect_rounded(
+                    &mut buf,
+                    win_w,
+                    bx,
+                    by,
+                    bw,
+                    bh,
+                    0x00555555,
                     SELECTION_RADIUS,
                 );
             }

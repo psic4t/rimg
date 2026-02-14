@@ -198,8 +198,8 @@ pub fn fill_rect(buf: &mut [u32], buf_w: u32, x: u32, y: u32, w: u32, h: u32, co
     }
 }
 
-/// Draw a rounded rectangle filled with a given color, alpha-blended over existing pixels.
-pub fn fill_rect_rounded_blend(
+/// Draw a filled rounded rectangle with a given XRGB color onto the buffer.
+pub fn fill_rect_rounded(
     buf: &mut [u32],
     buf_w: u32,
     x: u32,
@@ -207,14 +207,10 @@ pub fn fill_rect_rounded_blend(
     w: u32,
     h: u32,
     color: u32,
-    alpha: u32,
     radius: u32,
 ) {
     let r = radius.min(w / 2).min(h / 2);
     let r_sq = (r * r) as i64;
-    let ov_r = (color >> 16) & 0xFF;
-    let ov_g = (color >> 8) & 0xFF;
-    let ov_b = color & 0xFF;
 
     for row in y..y.saturating_add(h) {
         if row >= buf.len() as u32 / buf_w.max(1) {
@@ -244,17 +240,9 @@ pub fn fill_rect_rounded_blend(
             }
 
             let idx = (row * buf_w + col) as usize;
-            if idx >= buf.len() {
-                break;
+            if idx < buf.len() {
+                buf[idx] = color;
             }
-            let existing = buf[idx];
-            let bg_r = (existing >> 16) & 0xFF;
-            let bg_g = (existing >> 8) & 0xFF;
-            let bg_b = existing & 0xFF;
-            let out_r = (ov_r * alpha + bg_r * (255 - alpha)) / 255;
-            let out_g = (ov_g * alpha + bg_g * (255 - alpha)) / 255;
-            let out_b = (ov_b * alpha + bg_b * (255 - alpha)) / 255;
-            buf[idx] = (out_r << 16) | (out_g << 8) | out_b;
         }
     }
 }
