@@ -82,6 +82,20 @@ To uninstall:
 sudo make uninstall
 ```
 
+### Arch Linux (AUR)
+
+rimg is available in the [AUR](https://aur.archlinux.org/packages/rimg):
+
+```sh
+# Using an AUR helper (e.g., yay)
+yay -S rimg
+
+# Or manually
+git clone https://aur.archlinux.org/rimg.git
+cd rimg
+makepkg -si
+```
+
 ## Usage
 
 ```sh
