@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=rimg
+GenericName=Image Viewer
+Comment=Minimal Wayland image viewer with vim keybindings
+Exec=rimg %F
+Terminal=false
+NoDisplay=true
+MimeType=image/jpeg;image/png;image/gif;image/webp;image/bmp;image/tiff;image/svg+xml;image/avif;image/heic;image/heif;image/jxl;
+Categories=Graphics;Viewer;
