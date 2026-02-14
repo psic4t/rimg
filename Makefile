@@ -4,6 +4,13 @@ MAN = rimg.1
 SRC = $(shell find src -name '*.rs')
 TARGET = target/x86_64-unknown-linux-gnu/release/$(BIN)
 
+ifdef SUDO_USER
+  RUSTUP_HOME ?= $(shell echo ~$(SUDO_USER))/.rustup
+else
+  RUSTUP_HOME ?= $(HOME)/.rustup
+endif
+export RUSTUP_HOME
+
 .PHONY: all build release clean install uninstall
 
 all: build
