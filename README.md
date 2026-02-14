@@ -100,9 +100,8 @@ rimg -w wallpaper.jpg
 | `+` / `=` | Zoom in |
 | `-` | Zoom out |
 | `0` | Zoom reset (fit-to-window) |
-| `h/j/k/l` | Navigate images (also arrow keys) |
-| `Ctrl+h/j/k/l` | Pan when zoomed (also Ctrl+arrows) |
-| `Ctrl+w` | Toggle fit-to-window for small images |
+| `h/j/k/l` | Pan when zoomed, `h`/`l` navigate images otherwise (also arrow keys) |
+| `Shift+w` | Toggle fit-to-window for small images |
 | `Ctrl+0` | Display at actual size (1:1 pixels) |
 | `r` | Rotate clockwise 90 degrees |
 | `R` | Rotate counterclockwise 90 degrees |

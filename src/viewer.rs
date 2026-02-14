@@ -226,6 +226,11 @@ impl Viewer {
         true
     }
 
+    /// Returns true if the image is zoomed in beyond fit-to-window.
+    pub fn is_zoomed(&self) -> bool {
+        self.zoom > 1.0
+    }
+
     /// Returns true if any pan key is currently held.
     pub fn is_pan_animating(&self) -> bool {
         self.pan_active.iter().any(|&a| a)

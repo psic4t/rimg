@@ -19,6 +19,7 @@ pub struct KeyEvent {
     pub keysym: u32,
     pub pressed: bool,
     pub ctrl: bool,
+    pub shift: bool,
 }
 
 /// Events produced by the Wayland state for the application to handle.
@@ -220,6 +221,7 @@ pub struct WaylandState {
     xkb_keymap: *mut xkbcommon_dl::xkb_keymap,
     xkb_state: *mut xkbcommon_dl::xkb_state,
     ctrl_pressed: bool,
+    shift_pressed: bool,
 
     // Wallpaper mode
     pub wallpaper_mode: bool,
@@ -258,6 +260,7 @@ impl WaylandState {
             xkb_keymap: std::ptr::null_mut(),
             xkb_state: std::ptr::null_mut(),
             ctrl_pressed: false,
+            shift_pressed: false,
             wallpaper_mode,
             outputs: Vec::new(),
             layer_shell: None,
@@ -712,6 +715,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                     keysym,
                     pressed,
                     ctrl: state.ctrl_pressed,
+                    shift: state.shift_pressed,
                 }));
             }
             wl_keyboard::Event::Modifiers {
@@ -737,6 +741,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
                         (xkb.xkb_state_mod_name_is_active)(
                             state.xkb_state,
                             xkbcommon_dl::XKB_MOD_NAME_CTRL.as_ptr().cast(),
+                            xkbcommon_dl::xkb_state_component::XKB_STATE_MODS_EFFECTIVE,
+                        )
+                    } == 1;
+                    state.shift_pressed = unsafe {
+                        (xkb.xkb_state_mod_name_is_active)(
+                            state.xkb_state,
+                            xkbcommon_dl::XKB_MOD_NAME_SHIFT.as_ptr().cast(),
                             xkbcommon_dl::xkb_state_component::XKB_STATE_MODS_EFFECTIVE,
                         )
                     } == 1;
