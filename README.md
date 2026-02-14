@@ -3,8 +3,9 @@
 Minimal Wayland image viewer with vim keybindings.
 
 rimg is a fast, lightweight image viewer for Wayland with no GUI toolkit
-dependencies. It supports JPEG, PNG, GIF (animated), WebP, BMP, TIFF, and SVG
-formats. It can also set wallpapers on wlroots-based compositors via the
+dependencies. It supports JPEG, PNG, GIF (animated), WebP (animated), BMP, TIFF,
+SVG, AVIF (animated), HEIC/HEIF, and JPEG XL (animated) formats. It can also
+set wallpapers on wlroots-based compositors via the
 wlr-layer-shell protocol.
 
 ## Features
@@ -12,9 +13,9 @@ wlr-layer-shell protocol.
 - Vim-style keybindings for navigation
 - Viewer mode with zoom, pan, and rotation
 - Gallery mode with thumbnail grid
-- Animated GIF and WebP playback
-- EXIF metadata overlay (JPEG, TIFF, WebP, PNG)
-- Automatic EXIF orientation correction (JPEG, TIFF, WebP, PNG)
+- Animated GIF, WebP, AVIF, and JPEG XL playback
+- EXIF metadata overlay (JPEG, TIFF, WebP, PNG, AVIF, HEIC/HEIF, JPEG XL)
+- Automatic EXIF orientation correction (JPEG, TIFF, WebP, PNG, AVIF, JPEG XL)
 - Runtime sort cycling (name, size, EXIF date, modification time)
 - Graceful error handling: corrupt/unsupported images are auto-skipped
 - BMP support for 1-bit, 4-bit, and 8-bit indexed color
@@ -41,17 +42,20 @@ wlr-layer-shell protocol.
 - libtiff
 - librsvg-2 (SVG rendering)
 - libcairo (used by librsvg)
+- libavif (AVIF decoding)
+- libheif (HEIC/HEIF decoding)
+- libjxl (JPEG XL decoding)
 
 On Debian/Ubuntu:
 
 ```sh
-apt install libwayland-dev libxkbcommon-dev libturbojpeg0-dev libpng-dev libgif-dev libwebp-dev libtiff-dev librsvg2-dev libcairo2-dev
+apt install libwayland-dev libxkbcommon-dev libturbojpeg0-dev libpng-dev libgif-dev libwebp-dev libtiff-dev librsvg2-dev libcairo2-dev libavif-dev libheif-dev libjxl-dev
 ```
 
 On Arch Linux:
 
 ```sh
-pacman -S wayland libxkbcommon libjpeg-turbo libpng giflib libwebp libtiff librsvg cairo
+pacman -S wayland libxkbcommon libjpeg-turbo libpng giflib libwebp libtiff librsvg cairo libavif libheif libjxl
 ```
 
 ## Building

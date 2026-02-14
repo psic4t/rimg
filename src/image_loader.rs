@@ -6,7 +6,7 @@ use std::time::Duration;
 
 /// Supported image extensions (lowercase).
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif", "svg",
+    "jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif", "svg", "avif", "heic", "heif", "jxl",
 ];
 
 /// Maximum pixel count to prevent excessive memory allocation (256 megapixels).
@@ -173,6 +173,9 @@ pub fn load_image(path: &Path) -> Result<LoadedImage, String> {
         "bmp" => load_bmp(path),
         "tiff" | "tif" => load_tiff(path),
         "svg" => load_svg(path),
+        "avif" => load_avif(path),
+        "heic" | "heif" => load_heic(path),
+        "jxl" => load_jxl(path),
         _ => Err(format!("Unsupported format: {}", ext)),
     }
 }
@@ -1314,6 +1317,1071 @@ fn load_svg(path: &Path) -> Result<LoadedImage, String> {
 
         Ok(LoadedImage::Static(img))
     }
+}
+
+// ============================================================
+// AVIF via system libavif
+// ============================================================
+
+#[allow(non_camel_case_types)]
+mod libavif {
+    use std::os::raw::{c_int, c_uint, c_void};
+
+    pub const AVIF_RESULT_OK: c_int = 0;
+    pub const AVIF_RGB_FORMAT_RGBA: c_int = 0;
+
+    #[repr(C)]
+    pub struct avifImageTiming {
+        pub timescale: u64,
+        pub pts: f64,
+        pub pts_in_timescales: u64,
+        pub duration: f64,
+        pub duration_in_timescales: u64,
+    }
+
+    // Opaque types
+    pub type avifImage = c_void;
+    pub type avifDecoder = c_void;
+
+    // We access avifDecoder fields via offsets, but since the struct layout
+    // may change, we use getter-style FFI. Actually, avifDecoder fields are
+    // public in the C header, but we'll access them through helper functions
+    // to keep things safe. Since libavif doesn't have getter functions for
+    // all fields, we define a partial struct for the decoder.
+
+    #[repr(C)]
+    pub struct avifRGBImage {
+        pub width: c_uint,
+        pub height: c_uint,
+        pub depth: c_uint,
+        pub format: c_int,
+        pub chroma_upsampling: c_int,
+        pub chroma_downsampling: c_int,
+        pub avoid_libyuv: c_int,
+        pub ignore_alpha: c_int,
+        pub alpha_premultiplied: c_int,
+        pub is_float: c_int,
+        pub max_threads: c_int,
+        pub pixels: *mut u8,
+        pub row_bytes: c_uint,
+    }
+
+    #[link(name = "avif")]
+    extern "C" {
+        pub fn avifDecoderCreate() -> *mut avifDecoder;
+        pub fn avifDecoderDestroy(decoder: *mut avifDecoder);
+        pub fn avifDecoderSetIOMemory(
+            decoder: *mut avifDecoder,
+            data: *const u8,
+            size: usize,
+        ) -> c_int;
+        pub fn avifDecoderParse(decoder: *mut avifDecoder) -> c_int;
+        pub fn avifDecoderNextImage(decoder: *mut avifDecoder) -> c_int;
+        pub fn avifDecoderNthImageTiming(
+            decoder: *const avifDecoder,
+            frame_index: c_uint,
+            out_timing: *mut avifImageTiming,
+        ) -> c_int;
+        pub fn avifRGBImageSetDefaults(rgb: *mut avifRGBImage, image: *const avifImage);
+        pub fn avifRGBImageAllocatePixels(rgb: *mut avifRGBImage) -> c_int;
+        pub fn avifRGBImageFreePixels(rgb: *mut avifRGBImage);
+        pub fn avifImageYUVToRGB(image: *const avifImage, rgb: *mut avifRGBImage) -> c_int;
+    }
+}
+
+/// Read avifDecoder->image (offset depends on the struct layout).
+/// avifDecoder struct: first field is codecChoice (enum = c_int), then maxThreads (c_int),
+/// requestedSource (enum = c_int), allowProgressive (c_int), allowIncremental (c_int),
+/// ignoreExif (c_int), ignoreXMP (c_int), imageSizeLimit (u32), imageDimensionLimit (u32),
+/// imageCountLimit (u32), strictFlags (u32), then image (*mut avifImage).
+/// That's 10 * 4 + 4 = 44 bytes on most platforms, but we need to account for pointer alignment.
+/// Actually we should read from the struct pointer directly. Let's use a more reliable approach.
+///
+/// Helper to read decoder fields by casting to known offsets.
+/// We define a repr(C) partial mirror of the decoder struct for safe field access.
+#[repr(C)]
+struct AvifDecoderPartial {
+    codec_choice: c_int,
+    max_threads: c_int,
+    requested_source: c_int,
+    allow_progressive: c_int,
+    allow_incremental: c_int,
+    ignore_exif: c_int,
+    ignore_xmp: c_int,
+    image_size_limit: u32,
+    image_dimension_limit: u32,
+    image_count_limit: u32,
+    strict_flags: u32,
+    // Pointer-aligned field follows
+    image: *mut c_void,
+    image_index: c_int,
+    image_count: c_int,
+}
+
+fn load_avif(path: &Path) -> Result<LoadedImage, String> {
+    let data = read_file_limited(path)?;
+
+    unsafe {
+        let decoder = libavif::avifDecoderCreate();
+        if decoder.is_null() {
+            return Err("Failed to create AVIF decoder".to_string());
+        }
+
+        let result = libavif::avifDecoderSetIOMemory(decoder, data.as_ptr(), data.len());
+        if result != libavif::AVIF_RESULT_OK {
+            libavif::avifDecoderDestroy(decoder);
+            return Err(format!("Failed to set AVIF IO for {}", path.display()));
+        }
+
+        let result = libavif::avifDecoderParse(decoder);
+        if result != libavif::AVIF_RESULT_OK {
+            libavif::avifDecoderDestroy(decoder);
+            return Err(format!("Failed to parse AVIF {}", path.display()));
+        }
+
+        let dec = &*(decoder as *const AvifDecoderPartial);
+        let image_count = dec.image_count;
+        let is_animated = image_count > 1;
+
+        if is_animated {
+            let mut frames = Vec::new();
+            for i in 0..image_count {
+                let result = libavif::avifDecoderNextImage(decoder);
+                if result != libavif::AVIF_RESULT_OK {
+                    libavif::avifDecoderDestroy(decoder);
+                    return Err(format!(
+                        "Failed to decode AVIF frame {} of {}",
+                        i,
+                        path.display()
+                    ));
+                }
+
+                let dec = &*(decoder as *const AvifDecoderPartial);
+                let image = dec.image;
+
+                let mut rgb: libavif::avifRGBImage = std::mem::zeroed();
+                libavif::avifRGBImageSetDefaults(&mut rgb, image);
+                rgb.format = libavif::AVIF_RGB_FORMAT_RGBA;
+                rgb.depth = 8;
+
+                let res = libavif::avifRGBImageAllocatePixels(&mut rgb);
+                if res != libavif::AVIF_RESULT_OK {
+                    libavif::avifDecoderDestroy(decoder);
+                    return Err(format!(
+                        "Failed to allocate AVIF RGB pixels for {}",
+                        path.display()
+                    ));
+                }
+
+                let res = libavif::avifImageYUVToRGB(image, &mut rgb);
+                if res != libavif::AVIF_RESULT_OK {
+                    libavif::avifRGBImageFreePixels(&mut rgb);
+                    libavif::avifDecoderDestroy(decoder);
+                    return Err(format!(
+                        "Failed to convert AVIF to RGB for {}",
+                        path.display()
+                    ));
+                }
+
+                let w = rgb.width;
+                let h = rgb.height;
+                validate_dimensions(w, h, "AVIF").map_err(|e| {
+                    libavif::avifRGBImageFreePixels(&mut rgb);
+                    libavif::avifDecoderDestroy(decoder);
+                    e
+                })?;
+
+                let pixel_count = (w as usize) * (h as usize) * 4;
+                let mut pixels = vec![0u8; pixel_count];
+                let src_ptr = rgb.pixels;
+                let row_bytes = rgb.row_bytes as usize;
+                for y in 0..h as usize {
+                    let src_offset = y * row_bytes;
+                    let dst_offset = y * (w as usize) * 4;
+                    std::ptr::copy_nonoverlapping(
+                        src_ptr.add(src_offset),
+                        pixels.as_mut_ptr().add(dst_offset),
+                        (w as usize) * 4,
+                    );
+                }
+                libavif::avifRGBImageFreePixels(&mut rgb);
+
+                let img = RgbaImage::from_raw(w, h, pixels)
+                    .ok_or_else(|| "AVIF pixel buffer size mismatch".to_string())?;
+
+                // Get frame timing
+                let mut timing: libavif::avifImageTiming = std::mem::zeroed();
+                libavif::avifDecoderNthImageTiming(decoder, i as c_uint, &mut timing);
+                let duration_ms = (timing.duration * 1000.0) as u64;
+                let duration = Duration::from_millis(duration_ms.max(10));
+
+                frames.push((img, duration));
+            }
+
+            libavif::avifDecoderDestroy(decoder);
+
+            if frames.is_empty() {
+                return Err(format!("AVIF contains no frames: {}", path.display()));
+            }
+
+            Ok(LoadedImage::Animated { frames })
+        } else {
+            // Static AVIF
+            let result = libavif::avifDecoderNextImage(decoder);
+            if result != libavif::AVIF_RESULT_OK {
+                libavif::avifDecoderDestroy(decoder);
+                return Err(format!("Failed to decode AVIF {}", path.display()));
+            }
+
+            let dec = &*(decoder as *const AvifDecoderPartial);
+            let image = dec.image;
+
+            let mut rgb: libavif::avifRGBImage = std::mem::zeroed();
+            libavif::avifRGBImageSetDefaults(&mut rgb, image);
+            rgb.format = libavif::AVIF_RGB_FORMAT_RGBA;
+            rgb.depth = 8;
+
+            let res = libavif::avifRGBImageAllocatePixels(&mut rgb);
+            if res != libavif::AVIF_RESULT_OK {
+                libavif::avifDecoderDestroy(decoder);
+                return Err(format!(
+                    "Failed to allocate AVIF RGB pixels for {}",
+                    path.display()
+                ));
+            }
+
+            let res = libavif::avifImageYUVToRGB(image, &mut rgb);
+            if res != libavif::AVIF_RESULT_OK {
+                libavif::avifRGBImageFreePixels(&mut rgb);
+                libavif::avifDecoderDestroy(decoder);
+                return Err(format!(
+                    "Failed to convert AVIF to RGB for {}",
+                    path.display()
+                ));
+            }
+
+            let w = rgb.width;
+            let h = rgb.height;
+            validate_dimensions(w, h, "AVIF").map_err(|e| {
+                libavif::avifRGBImageFreePixels(&mut rgb);
+                libavif::avifDecoderDestroy(decoder);
+                e
+            })?;
+
+            let pixel_count = (w as usize) * (h as usize) * 4;
+            let mut pixels = vec![0u8; pixel_count];
+            let src_ptr = rgb.pixels;
+            let row_bytes = rgb.row_bytes as usize;
+            for y in 0..h as usize {
+                let src_offset = y * row_bytes;
+                let dst_offset = y * (w as usize) * 4;
+                std::ptr::copy_nonoverlapping(
+                    src_ptr.add(src_offset),
+                    pixels.as_mut_ptr().add(dst_offset),
+                    (w as usize) * 4,
+                );
+            }
+            libavif::avifRGBImageFreePixels(&mut rgb);
+
+            // Extract EXIF orientation before destroying decoder
+            // avifImage.exif is at a known offset — we extract it from raw data instead
+            // since the struct layout is complex. We'll use our own EXIF parser on the
+            // raw AVIF container.
+            libavif::avifDecoderDestroy(decoder);
+
+            let mut img = RgbaImage::from_raw(w, h, pixels)
+                .ok_or_else(|| "AVIF pixel buffer size mismatch".to_string())?;
+
+            // Apply EXIF orientation from raw AVIF data
+            if let Some(orientation) = read_exif_orientation_avif(&data) {
+                img = apply_orientation(img, orientation);
+            }
+
+            Ok(LoadedImage::Static(img))
+        }
+    }
+}
+
+/// Extract EXIF data from an AVIF/HEIF container (ISOBMFF format).
+/// Searches for an "Exif" box within the meta box's iloc-referenced items,
+/// but the simplest approach for AVIF is to scan for the Exif header pattern.
+fn extract_avif_exif(data: &[u8]) -> Option<Vec<u8>> {
+    // AVIF uses ISOBMFF (ISO Base Media File Format).
+    // The Exif data is stored as an item referenced by iloc.
+    // A simpler approach: scan for "Exif" followed by TIFF header.
+    // The AVIF Exif item starts with a 4-byte big-endian offset to the TIFF header,
+    // followed by the TIFF data ("II" or "MM").
+
+    // Walk ISOBMFF boxes looking for meta box containing Exif
+    let mut pos = 0;
+    while pos + 8 <= data.len() {
+        let box_size =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        if pos + 4 + 4 > data.len() {
+            break;
+        }
+        let box_type = &data[pos + 4..pos + 8];
+
+        let actual_size = if box_size == 0 {
+            data.len() - pos // box extends to EOF
+        } else if box_size == 1 {
+            // 64-bit extended size
+            if pos + 16 > data.len() {
+                break;
+            }
+            let ext = u64::from_be_bytes([
+                data[pos + 8],
+                data[pos + 9],
+                data[pos + 10],
+                data[pos + 11],
+                data[pos + 12],
+                data[pos + 13],
+                data[pos + 14],
+                data[pos + 15],
+            ]) as usize;
+            ext
+        } else {
+            box_size
+        };
+
+        if actual_size < 8 || pos + actual_size > data.len() {
+            break;
+        }
+
+        if box_type == b"meta" {
+            // meta box has a 4-byte version/flags field after the header
+            let inner_start = pos + 12; // 8 (header) + 4 (version/flags)
+            if let Some(exif) = find_exif_in_meta(&data[inner_start..pos + actual_size]) {
+                return Some(exif);
+            }
+        }
+
+        pos += actual_size;
+    }
+    None
+}
+
+/// Search within a meta box's children for Exif item data.
+/// This is a simplified parser that looks for "Exif" boxes or
+/// scans the iloc data for Exif items.
+fn find_exif_in_meta(data: &[u8]) -> Option<Vec<u8>> {
+    // Walk sub-boxes of meta looking for "iinf" to find Exif item ID,
+    // then "iloc" to find offset/length, then extract from file data.
+    // This is complex, so we use a simpler heuristic: scan for the
+    // Exif TIFF header pattern preceded by a 4-byte offset.
+
+    // Look for pattern: 4-byte offset (usually 0x00000000 or small) + "II" or "MM" + 0x002A
+    for i in 0..data.len().saturating_sub(10) {
+        let b = &data[i..];
+        if b.len() < 10 {
+            break;
+        }
+        // Check for TIFF header at offset i+4
+        let has_tiff = (b[4] == b'I' && b[5] == b'I' && b[6] == 0x2A && b[7] == 0x00)
+            || (b[4] == b'M' && b[5] == b'M' && b[6] == 0x00 && b[7] == 0x2A);
+        if has_tiff {
+            // The 4 bytes before TIFF header are the exif_tiff_header_offset
+            // (should be 0 for standard Exif)
+            let _offset = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+            // Return the TIFF data (starting from b[4])
+            return Some(data[i + 4..].to_vec());
+        }
+    }
+    None
+}
+
+/// Read EXIF orientation from raw AVIF data.
+fn read_exif_orientation_avif(data: &[u8]) -> Option<u32> {
+    let exif_data = extract_avif_exif(data)?;
+    parse_tiff_orientation(&exif_data, 0)
+}
+
+/// Read all EXIF tags from raw AVIF data.
+pub fn read_exif_tags_avif(data: &[u8]) -> Vec<(String, String)> {
+    if let Some(exif_data) = extract_avif_exif(data) {
+        return parse_all_exif_tags(&exif_data, 0);
+    }
+    Vec::new()
+}
+
+// ============================================================
+// HEIC/HEIF via system libheif
+// ============================================================
+
+#[allow(non_camel_case_types)]
+mod libheif {
+    use std::os::raw::{c_char, c_int, c_void};
+
+    pub const HEIF_ERROR_OK: c_int = 0;
+    pub const HEIF_COLORSPACE_RGB: c_int = 1;
+    pub const HEIF_CHROMA_INTERLEAVED_RGBA: c_int = 11;
+    pub const HEIF_CHANNEL_INTERLEAVED: c_int = 10;
+
+    #[repr(C)]
+    pub struct heif_error {
+        pub code: c_int,
+        pub subcode: c_int,
+        pub message: *const c_char,
+    }
+
+    pub type heif_context = c_void;
+    pub type heif_image_handle = c_void;
+    pub type heif_image = c_void;
+    pub type heif_decoding_options = c_void;
+
+    pub type heif_item_id = u32;
+
+    #[link(name = "heif")]
+    extern "C" {
+        pub fn heif_context_alloc() -> *mut heif_context;
+        pub fn heif_context_free(ctx: *mut heif_context);
+        pub fn heif_context_read_from_memory_without_copy(
+            ctx: *mut heif_context,
+            mem: *const u8,
+            size: usize,
+            options: *const c_void,
+        ) -> heif_error;
+        pub fn heif_context_get_primary_image_handle(
+            ctx: *mut heif_context,
+            handle: *mut *mut heif_image_handle,
+        ) -> heif_error;
+        pub fn heif_image_handle_release(handle: *mut heif_image_handle);
+        pub fn heif_image_handle_get_width(handle: *const heif_image_handle) -> c_int;
+        pub fn heif_image_handle_get_height(handle: *const heif_image_handle) -> c_int;
+        pub fn heif_decode_image(
+            handle: *const heif_image_handle,
+            out_img: *mut *mut heif_image,
+            colorspace: c_int,
+            chroma: c_int,
+            options: *const heif_decoding_options,
+        ) -> heif_error;
+        pub fn heif_image_get_plane_readonly(
+            image: *const heif_image,
+            channel: c_int,
+            out_stride: *mut c_int,
+        ) -> *const u8;
+        pub fn heif_image_release(image: *mut heif_image);
+
+        // EXIF metadata
+        pub fn heif_image_handle_get_number_of_metadata_blocks(
+            handle: *const heif_image_handle,
+            type_filter: *const c_char,
+        ) -> c_int;
+        pub fn heif_image_handle_get_list_of_metadata_block_IDs(
+            handle: *const heif_image_handle,
+            type_filter: *const c_char,
+            ids: *mut heif_item_id,
+            count: c_int,
+        ) -> c_int;
+        pub fn heif_image_handle_get_metadata_size(
+            handle: *const heif_image_handle,
+            metadata_id: heif_item_id,
+        ) -> usize;
+        pub fn heif_image_handle_get_metadata(
+            handle: *const heif_image_handle,
+            metadata_id: heif_item_id,
+            out_data: *mut u8,
+        ) -> heif_error;
+    }
+}
+
+fn load_heic(path: &Path) -> Result<LoadedImage, String> {
+    let data = read_file_limited(path)?;
+
+    unsafe {
+        let ctx = libheif::heif_context_alloc();
+        if ctx.is_null() {
+            return Err("Failed to allocate HEIF context".to_string());
+        }
+
+        let err = libheif::heif_context_read_from_memory_without_copy(
+            ctx,
+            data.as_ptr(),
+            data.len(),
+            std::ptr::null(),
+        );
+        if err.code != libheif::HEIF_ERROR_OK {
+            libheif::heif_context_free(ctx);
+            return Err(format!("Failed to read HEIC {}", path.display()));
+        }
+
+        let mut handle: *mut libheif::heif_image_handle = std::ptr::null_mut();
+        let err = libheif::heif_context_get_primary_image_handle(ctx, &mut handle);
+        if err.code != libheif::HEIF_ERROR_OK {
+            libheif::heif_context_free(ctx);
+            return Err(format!(
+                "Failed to get HEIC primary image handle for {}",
+                path.display()
+            ));
+        }
+
+        let w = libheif::heif_image_handle_get_width(handle) as u32;
+        let h = libheif::heif_image_handle_get_height(handle) as u32;
+        validate_dimensions(w, h, "HEIC").map_err(|e| {
+            libheif::heif_image_handle_release(handle);
+            libheif::heif_context_free(ctx);
+            e
+        })?;
+
+        let mut img_ptr: *mut libheif::heif_image = std::ptr::null_mut();
+        let err = libheif::heif_decode_image(
+            handle,
+            &mut img_ptr,
+            libheif::HEIF_COLORSPACE_RGB,
+            libheif::HEIF_CHROMA_INTERLEAVED_RGBA,
+            std::ptr::null(),
+        );
+        if err.code != libheif::HEIF_ERROR_OK {
+            libheif::heif_image_handle_release(handle);
+            libheif::heif_context_free(ctx);
+            return Err(format!("Failed to decode HEIC {}", path.display()));
+        }
+
+        let mut stride: c_int = 0;
+        let plane = libheif::heif_image_get_plane_readonly(
+            img_ptr,
+            libheif::HEIF_CHANNEL_INTERLEAVED,
+            &mut stride,
+        );
+        if plane.is_null() {
+            libheif::heif_image_release(img_ptr);
+            libheif::heif_image_handle_release(handle);
+            libheif::heif_context_free(ctx);
+            return Err(format!(
+                "Failed to get HEIC pixel data for {}",
+                path.display()
+            ));
+        }
+
+        let stride = stride as usize;
+        let pixel_count = (w as usize) * (h as usize) * 4;
+        let mut pixels = vec![0u8; pixel_count];
+        for y in 0..h as usize {
+            let src_offset = y * stride;
+            let dst_offset = y * (w as usize) * 4;
+            std::ptr::copy_nonoverlapping(
+                plane.add(src_offset),
+                pixels.as_mut_ptr().add(dst_offset),
+                (w as usize) * 4,
+            );
+        }
+
+        // Extract EXIF metadata before releasing handle
+        let exif_data = extract_heif_exif(handle);
+
+        libheif::heif_image_release(img_ptr);
+        libheif::heif_image_handle_release(handle);
+        libheif::heif_context_free(ctx);
+
+        let img = RgbaImage::from_raw(w, h, pixels)
+            .ok_or_else(|| "HEIC pixel buffer size mismatch".to_string())?;
+
+        // libheif applies geometric transforms (rotation/mirror) by default
+        // (ignore_transformations=false in decoding options), so we do NOT apply
+        // EXIF orientation ourselves. The EXIF data is kept for tag display only.
+        let _ = exif_data;
+
+        Ok(LoadedImage::Static(img))
+    }
+}
+
+/// Extract raw EXIF data from a HEIF image handle via libheif metadata API.
+unsafe fn extract_heif_exif(handle: *const libheif::heif_image_handle) -> Option<Vec<u8>> {
+    let exif_filter = b"Exif\0".as_ptr() as *const c_char;
+    let count = libheif::heif_image_handle_get_number_of_metadata_blocks(handle, exif_filter);
+    if count <= 0 {
+        return None;
+    }
+
+    let mut ids = vec![0u32; count as usize];
+    libheif::heif_image_handle_get_list_of_metadata_block_IDs(
+        handle,
+        exif_filter,
+        ids.as_mut_ptr(),
+        count,
+    );
+
+    let size = libheif::heif_image_handle_get_metadata_size(handle, ids[0]);
+    if size == 0 || size > 64 * 1024 * 1024 {
+        return None;
+    }
+
+    let mut buf = vec![0u8; size];
+    let err = libheif::heif_image_handle_get_metadata(handle, ids[0], buf.as_mut_ptr());
+    if err.code != libheif::HEIF_ERROR_OK {
+        return None;
+    }
+
+    // libheif returns: 4-byte Exif TIFF header offset (big-endian) + TIFF data
+    if buf.len() < 8 {
+        return None;
+    }
+    let tiff_offset = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let tiff_start = 4 + tiff_offset;
+    if tiff_start >= buf.len() {
+        return None;
+    }
+
+    Some(buf[tiff_start..].to_vec())
+}
+
+/// Read EXIF tags from HEIC/HEIF by parsing the ISOBMFF container.
+/// We reuse the AVIF EXIF extraction since HEIC uses the same container format.
+pub fn read_exif_tags_heic(data: &[u8]) -> Vec<(String, String)> {
+    // For HEIC, we can use the same ISOBMFF scanning approach as AVIF
+    if let Some(exif_data) = extract_avif_exif(data) {
+        return parse_all_exif_tags(&exif_data, 0);
+    }
+    Vec::new()
+}
+
+// ============================================================
+// JPEG XL via system libjxl
+// ============================================================
+
+#[allow(non_camel_case_types)]
+mod libjxl {
+    use std::os::raw::c_void;
+
+    // JxlDecoderStatus values
+    pub const JXL_DEC_SUCCESS: u32 = 0;
+    pub const JXL_DEC_ERROR: u32 = 1;
+    #[allow(dead_code)]
+    pub const JXL_DEC_NEED_MORE_INPUT: u32 = 2;
+    pub const JXL_DEC_NEED_IMAGE_OUT_BUFFER: u32 = 5;
+    pub const JXL_DEC_BASIC_INFO: u32 = 0x40;
+    pub const JXL_DEC_FRAME: u32 = 0x400;
+    pub const JXL_DEC_FULL_IMAGE: u32 = 0x1000;
+
+    // JxlDataType values
+    pub const JXL_TYPE_UINT8: u32 = 2;
+
+    // JxlEndianness
+    pub const JXL_NATIVE_ENDIAN: u32 = 0;
+
+    pub type JxlDecoder = c_void;
+
+    #[repr(C)]
+    pub struct JxlPixelFormat {
+        pub num_channels: u32,
+        pub data_type: u32,
+        pub endianness: u32,
+        pub align: usize,
+    }
+
+    #[repr(C)]
+    pub struct JxlAnimationHeader {
+        pub tps_numerator: u32,
+        pub tps_denominator: u32,
+        pub num_loops: u32,
+        pub have_timecodes: i32,
+    }
+
+    #[repr(C)]
+    pub struct JxlPreviewHeader {
+        pub xsize: u32,
+        pub ysize: u32,
+    }
+
+    #[repr(C)]
+    pub struct JxlBasicInfo {
+        pub have_container: i32,
+        pub xsize: u32,
+        pub ysize: u32,
+        pub bits_per_sample: u32,
+        pub exponent_bits_per_sample: u32,
+        pub intensity_target: f32,
+        pub min_nits: f32,
+        pub relative_to_max_display: i32,
+        pub linear_below: f32,
+        pub uses_original_profile: i32,
+        pub have_preview: i32,
+        pub have_animation: i32,
+        pub orientation: u32,
+        pub num_color_channels: u32,
+        pub num_extra_channels: u32,
+        pub alpha_bits: u32,
+        pub alpha_exponent_bits: u32,
+        pub alpha_premultiplied: i32,
+        pub preview: JxlPreviewHeader,
+        pub animation: JxlAnimationHeader,
+        pub intrinsic_xsize: u32,
+        pub intrinsic_ysize: u32,
+        pub padding: [u8; 100],
+    }
+
+    #[repr(C)]
+    pub struct JxlLayerInfo {
+        pub have_crop: i32,
+        pub crop_x0: i32,
+        pub crop_y0: i32,
+        pub xsize: u32,
+        pub ysize: u32,
+        pub blend_info: JxlBlendInfo,
+        pub save_as_reference: u32,
+    }
+
+    #[repr(C)]
+    pub struct JxlBlendInfo {
+        pub blendmode: u32,
+        pub source: u32,
+        pub alpha: u32,
+        pub clamp: i32,
+    }
+
+    #[repr(C)]
+    pub struct JxlFrameHeader {
+        pub duration: u32,
+        pub timecode: u32,
+        pub name_length: u32,
+        pub is_last: i32,
+        pub layer_info: JxlLayerInfo,
+    }
+
+    #[link(name = "jxl")]
+    extern "C" {
+        pub fn JxlDecoderCreate(memory_manager: *const c_void) -> *mut JxlDecoder;
+        pub fn JxlDecoderDestroy(dec: *mut JxlDecoder);
+        pub fn JxlDecoderSubscribeEvents(dec: *mut JxlDecoder, events_wanted: i32) -> u32;
+        pub fn JxlDecoderSetInput(dec: *mut JxlDecoder, data: *const u8, size: usize) -> u32;
+        pub fn JxlDecoderCloseInput(dec: *mut JxlDecoder);
+        pub fn JxlDecoderProcessInput(dec: *mut JxlDecoder) -> u32;
+        pub fn JxlDecoderGetBasicInfo(dec: *const JxlDecoder, info: *mut JxlBasicInfo) -> u32;
+        pub fn JxlDecoderGetFrameHeader(dec: *const JxlDecoder, header: *mut JxlFrameHeader)
+            -> u32;
+        pub fn JxlDecoderImageOutBufferSize(
+            dec: *const JxlDecoder,
+            format: *const JxlPixelFormat,
+            size: *mut usize,
+        ) -> u32;
+        pub fn JxlDecoderSetImageOutBuffer(
+            dec: *mut JxlDecoder,
+            format: *const JxlPixelFormat,
+            buffer: *mut u8,
+            size: usize,
+        ) -> u32;
+        pub fn JxlDecoderSetParallelRunner(
+            dec: *mut JxlDecoder,
+            parallel_runner: *const c_void,
+            parallel_runner_opaque: *mut c_void,
+        ) -> u32;
+    }
+
+    #[link(name = "jxl_threads")]
+    extern "C" {
+        pub fn JxlThreadParallelRunnerCreate(
+            memory_manager: *const c_void,
+            num_worker_threads: usize,
+        ) -> *mut c_void;
+        pub fn JxlThreadParallelRunnerDestroy(runner_opaque: *mut c_void);
+        pub fn JxlThreadParallelRunnerDefaultNumWorkerThreads() -> usize;
+
+        // The actual runner function — used as a function pointer
+        pub fn JxlThreadParallelRunner(
+            runner_opaque: *mut c_void,
+            jpegxl_opaque: *mut c_void,
+            init: *mut c_void,
+            func: *mut c_void,
+            start_range: u32,
+            end_range: u32,
+        ) -> i32;
+    }
+}
+
+fn load_jxl(path: &Path) -> Result<LoadedImage, String> {
+    let data = read_file_limited(path)?;
+
+    unsafe {
+        let dec = libjxl::JxlDecoderCreate(std::ptr::null());
+        if dec.is_null() {
+            return Err("Failed to create JPEG XL decoder".to_string());
+        }
+
+        // Set up thread parallel runner
+        let num_threads = libjxl::JxlThreadParallelRunnerDefaultNumWorkerThreads();
+        let runner = libjxl::JxlThreadParallelRunnerCreate(std::ptr::null(), num_threads);
+        if !runner.is_null() {
+            libjxl::JxlDecoderSetParallelRunner(
+                dec,
+                libjxl::JxlThreadParallelRunner as *const c_void,
+                runner,
+            );
+        }
+
+        // Subscribe to events
+        let events = (libjxl::JXL_DEC_BASIC_INFO
+            | libjxl::JXL_DEC_FRAME
+            | libjxl::JXL_DEC_FULL_IMAGE) as i32;
+        if libjxl::JxlDecoderSubscribeEvents(dec, events) != libjxl::JXL_DEC_SUCCESS {
+            cleanup_jxl(dec, runner);
+            return Err(format!(
+                "Failed to subscribe JXL events for {}",
+                path.display()
+            ));
+        }
+
+        // Set input
+        if libjxl::JxlDecoderSetInput(dec, data.as_ptr(), data.len()) != libjxl::JXL_DEC_SUCCESS {
+            cleanup_jxl(dec, runner);
+            return Err(format!("Failed to set JXL input for {}", path.display()));
+        }
+        libjxl::JxlDecoderCloseInput(dec);
+
+        let pixel_format = libjxl::JxlPixelFormat {
+            num_channels: 4,
+            data_type: libjxl::JXL_TYPE_UINT8,
+            endianness: libjxl::JXL_NATIVE_ENDIAN,
+            align: 0,
+        };
+
+        let mut info: libjxl::JxlBasicInfo = std::mem::zeroed();
+        let mut frames: Vec<(RgbaImage, Duration)> = Vec::new();
+        let mut current_buffer: Vec<u8> = Vec::new();
+        let mut is_animated = false;
+
+        loop {
+            let status = libjxl::JxlDecoderProcessInput(dec);
+
+            match status {
+                s if s == libjxl::JXL_DEC_BASIC_INFO => {
+                    if libjxl::JxlDecoderGetBasicInfo(dec, &mut info) != libjxl::JXL_DEC_SUCCESS {
+                        cleanup_jxl(dec, runner);
+                        return Err(format!(
+                            "Failed to get JXL basic info for {}",
+                            path.display()
+                        ));
+                    }
+                    validate_dimensions(info.xsize, info.ysize, "JXL").map_err(|e| {
+                        cleanup_jxl(dec, runner);
+                        e
+                    })?;
+                    is_animated = info.have_animation != 0;
+                }
+                s if s == libjxl::JXL_DEC_FRAME => {
+                    // Get frame header for duration
+                    let mut frame_header: libjxl::JxlFrameHeader = std::mem::zeroed();
+                    libjxl::JxlDecoderGetFrameHeader(dec, &mut frame_header);
+
+                    // Allocate output buffer
+                    let mut buf_size: usize = 0;
+                    if libjxl::JxlDecoderImageOutBufferSize(dec, &pixel_format, &mut buf_size)
+                        != libjxl::JXL_DEC_SUCCESS
+                    {
+                        cleanup_jxl(dec, runner);
+                        return Err(format!(
+                            "Failed to get JXL output buffer size for {}",
+                            path.display()
+                        ));
+                    }
+
+                    current_buffer = vec![0u8; buf_size];
+                    if libjxl::JxlDecoderSetImageOutBuffer(
+                        dec,
+                        &pixel_format,
+                        current_buffer.as_mut_ptr(),
+                        buf_size,
+                    ) != libjxl::JXL_DEC_SUCCESS
+                    {
+                        cleanup_jxl(dec, runner);
+                        return Err(format!(
+                            "Failed to set JXL output buffer for {}",
+                            path.display()
+                        ));
+                    }
+
+                    if is_animated {
+                        // Calculate frame duration
+                        let tps_num = info.animation.tps_numerator as f64;
+                        let tps_den = info.animation.tps_denominator as f64;
+                        let duration_secs = if tps_num > 0.0 {
+                            (frame_header.duration as f64) * tps_den / tps_num
+                        } else {
+                            0.1 // fallback 100ms
+                        };
+                        let duration_ms = (duration_secs * 1000.0) as u64;
+                        // Store duration temporarily; we'll pair it with the image at FULL_IMAGE
+                        // We push a placeholder that we'll update
+                        frames.push((
+                            RgbaImage::new(1, 1), // placeholder
+                            Duration::from_millis(duration_ms.max(10)),
+                        ));
+                    }
+                }
+                s if s == libjxl::JXL_DEC_NEED_IMAGE_OUT_BUFFER => {
+                    // Buffer already set at FRAME event
+                    // If we somehow get here without having set the buffer, set it now
+                    let mut buf_size: usize = 0;
+                    if libjxl::JxlDecoderImageOutBufferSize(dec, &pixel_format, &mut buf_size)
+                        != libjxl::JXL_DEC_SUCCESS
+                    {
+                        cleanup_jxl(dec, runner);
+                        return Err(format!(
+                            "Failed to get JXL output buffer size for {}",
+                            path.display()
+                        ));
+                    }
+                    if current_buffer.is_empty() {
+                        current_buffer = vec![0u8; buf_size];
+                    }
+                    if libjxl::JxlDecoderSetImageOutBuffer(
+                        dec,
+                        &pixel_format,
+                        current_buffer.as_mut_ptr(),
+                        current_buffer.len(),
+                    ) != libjxl::JXL_DEC_SUCCESS
+                    {
+                        cleanup_jxl(dec, runner);
+                        return Err(format!(
+                            "Failed to set JXL output buffer for {}",
+                            path.display()
+                        ));
+                    }
+                }
+                s if s == libjxl::JXL_DEC_FULL_IMAGE => {
+                    let img = RgbaImage::from_raw(
+                        info.xsize,
+                        info.ysize,
+                        std::mem::take(&mut current_buffer),
+                    )
+                    .ok_or_else(|| "JXL pixel buffer size mismatch".to_string())?;
+
+                    if is_animated {
+                        // Replace placeholder with actual image
+                        if let Some(last) = frames.last_mut() {
+                            last.0 = img;
+                        }
+                    } else {
+                        // Static image — apply orientation and return
+                        let orientation = info.orientation;
+                        let img = if orientation >= 2 && orientation <= 8 {
+                            apply_orientation(img, orientation)
+                        } else {
+                            img
+                        };
+                        cleanup_jxl(dec, runner);
+                        return Ok(LoadedImage::Static(img));
+                    }
+                }
+                s if s == libjxl::JXL_DEC_SUCCESS => {
+                    break;
+                }
+                s if s == libjxl::JXL_DEC_ERROR => {
+                    cleanup_jxl(dec, runner);
+                    return Err(format!("JXL decode error for {}", path.display()));
+                }
+                _ => {
+                    // Unknown status, try to continue
+                    break;
+                }
+            }
+        }
+
+        cleanup_jxl(dec, runner);
+
+        if is_animated && !frames.is_empty() {
+            // Apply orientation to all frames
+            let orientation = info.orientation;
+            if orientation >= 2 && orientation <= 8 {
+                for frame in &mut frames {
+                    let rotated = apply_orientation(
+                        std::mem::replace(&mut frame.0, RgbaImage::new(1, 1)),
+                        orientation,
+                    );
+                    frame.0 = rotated;
+                }
+            }
+            Ok(LoadedImage::Animated { frames })
+        } else {
+            Err(format!("JXL contains no frames: {}", path.display()))
+        }
+    }
+}
+
+unsafe fn cleanup_jxl(dec: *mut libjxl::JxlDecoder, runner: *mut c_void) {
+    libjxl::JxlDecoderDestroy(dec);
+    if !runner.is_null() {
+        libjxl::JxlThreadParallelRunnerDestroy(runner);
+    }
+}
+
+/// Read EXIF tags from JXL data.
+/// JXL stores EXIF in a box of type "Exif" in the container.
+/// The Exif box starts with a 4-byte big-endian TIFF header offset, then TIFF data.
+pub fn read_exif_tags_jxl(data: &[u8]) -> Vec<(String, String)> {
+    if let Some(exif_data) = extract_jxl_exif(data) {
+        return parse_all_exif_tags(&exif_data, 0);
+    }
+    Vec::new()
+}
+
+/// Extract EXIF data from a JXL container.
+/// JXL container format uses ISOBMFF-like boxes: 4-byte size + 4-byte type.
+fn extract_jxl_exif(data: &[u8]) -> Option<Vec<u8>> {
+    // JXL container starts with JXL signature box:
+    // 0x0000000C 'JXL ' 0x0D0A870A (12 bytes)
+    // Then followed by jxlc/jxlp boxes and metadata boxes.
+    // Check for JXL container signature
+    if data.len() < 12 {
+        return None;
+    }
+    // JXL container signature: 00 00 00 0C 4A 58 4C 20 0D 0A 87 0A
+    let jxl_sig = [
+        0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+    ];
+    if data[..12] != jxl_sig {
+        // Not a JXL container (might be bare codestream) — no EXIF boxes
+        return None;
+    }
+
+    let mut pos = 0;
+    while pos + 8 <= data.len() {
+        let box_size =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let box_type = &data[pos + 4..pos + 8];
+
+        let (header_size, actual_size) = if box_size == 0 {
+            (8, data.len() - pos)
+        } else if box_size == 1 {
+            if pos + 16 > data.len() {
+                break;
+            }
+            let ext = u64::from_be_bytes([
+                data[pos + 8],
+                data[pos + 9],
+                data[pos + 10],
+                data[pos + 11],
+                data[pos + 12],
+                data[pos + 13],
+                data[pos + 14],
+                data[pos + 15],
+            ]) as usize;
+            (16, ext)
+        } else {
+            (8, box_size)
+        };
+
+        if actual_size < header_size || pos + actual_size > data.len() {
+            break;
+        }
+
+        if box_type == b"Exif" {
+            let payload = &data[pos + header_size..pos + actual_size];
+            // Exif box: 4-byte big-endian TIFF header offset + TIFF data
+            if payload.len() < 8 {
+                return None;
+            }
+            let tiff_offset =
+                u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+            let tiff_start = 4 + tiff_offset;
+            if tiff_start >= payload.len() {
+                return None;
+            }
+            return Some(payload[tiff_start..].to_vec());
+        }
+
+        pos += actual_size;
+    }
+    None
 }
 
 // ============================================================
@@ -2777,5 +3845,67 @@ mod tests {
     fn test_exif_empty() {
         let result = parse_tiff_orientation(&[], 0);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_load_avif() {
+        let path = std::path::Path::new("test_images/test.avif");
+        if !path.exists() {
+            return; // skip if test image not available
+        }
+        let result = load_image(path);
+        assert!(result.is_ok(), "Failed to load AVIF: {:?}", result.err());
+        match result.unwrap() {
+            LoadedImage::Static(img) => {
+                assert_eq!(img.width, 64);
+                assert_eq!(img.height, 64);
+            }
+            _ => panic!("Expected static image"),
+        }
+    }
+
+    #[test]
+    fn test_load_heic() {
+        let path = std::path::Path::new("test_images/test.heic");
+        if !path.exists() {
+            return; // skip if test image not available
+        }
+        let result = load_image(path);
+        assert!(result.is_ok(), "Failed to load HEIC: {:?}", result.err());
+        match result.unwrap() {
+            LoadedImage::Static(img) => {
+                assert_eq!(img.width, 64);
+                assert_eq!(img.height, 64);
+            }
+            _ => panic!("Expected static image"),
+        }
+    }
+
+    #[test]
+    fn test_load_jxl() {
+        let path = std::path::Path::new("test_images/test.jxl");
+        if !path.exists() {
+            return; // skip if test image not available
+        }
+        let result = load_image(path);
+        assert!(result.is_ok(), "Failed to load JXL: {:?}", result.err());
+        match result.unwrap() {
+            LoadedImage::Static(img) => {
+                assert_eq!(img.width, 64);
+                assert_eq!(img.height, 64);
+            }
+            _ => panic!("Expected static image"),
+        }
+    }
+
+    #[test]
+    fn test_supported_extensions_include_new_formats() {
+        assert!(is_supported_image(std::path::Path::new("test.avif")));
+        assert!(is_supported_image(std::path::Path::new("test.heic")));
+        assert!(is_supported_image(std::path::Path::new("test.heif")));
+        assert!(is_supported_image(std::path::Path::new("test.jxl")));
+        assert!(is_supported_image(std::path::Path::new("test.AVIF")));
+        assert!(is_supported_image(std::path::Path::new("test.HEIC")));
+        assert!(is_supported_image(std::path::Path::new("test.JXL")));
     }
 }

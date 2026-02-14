@@ -504,6 +504,9 @@ impl App {
                         "tiff" | "tif" => image_loader::read_exif_tags_tiff(&data),
                         "webp" => image_loader::read_exif_tags_webp(&data),
                         "png" => image_loader::read_exif_tags_png(&data),
+                        "avif" => image_loader::read_exif_tags_avif(&data),
+                        "heic" | "heif" => image_loader::read_exif_tags_heic(&data),
+                        "jxl" => image_loader::read_exif_tags_jxl(&data),
                         _ => Vec::new(),
                     };
                     self.viewer.set_exif_data(tags);
