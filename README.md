@@ -59,6 +59,22 @@ cargo build --release
 
 The binary is placed at `target/x86_64-unknown-linux-gnu/release/rimg`.
 
+## Installation
+
+```sh
+sudo make install
+```
+
+This installs the binary to `/usr/local/bin`, the man page to
+`/usr/local/share/man/man1`, and the README to `/usr/local/share/doc/rimg`.
+Set `PREFIX` to change the install location (e.g. `sudo make PREFIX=/usr install`).
+
+To uninstall:
+
+```sh
+sudo make uninstall
+```
+
 ## Usage
 
 ```sh
@@ -124,6 +140,11 @@ rimg -w wallpaper.jpg
 | `q` | Quit |
 | `Escape` | Return to viewer mode |
 
-## Author
+## License
+Copyright (C) 2026 psic4t
 
-psic4t <psic4t@data.haus>
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>. 
