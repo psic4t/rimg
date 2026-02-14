@@ -2,7 +2,7 @@ PREFIX ?= /usr/local
 BIN = rimg
 MAN = rimg.1
 SRC = $(shell find src -name '*.rs')
-TARGET = target/x86_64-unknown-linux-gnu/release/$(BIN)
+TARGET = target/release/$(BIN)
 
 ifdef SUDO_USER
   RUSTUP_HOME ?= $(shell echo ~$(SUDO_USER))/.rustup

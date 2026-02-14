@@ -1,9 +1,2 @@
-[unstable]
-build-std = ["std", "core", "alloc", "panic_abort"]
-build-std-features = ["optimize_for_size"]
-
-[build]
-target = "x86_64-unknown-linux-gnu"
-
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "relocation-model=static", "-C", "link-args=-Wl,--gc-sections -Wl,-z,norelro -Wl,-T,linker.ld -Wl,-no-pie"]
+rustflags = ["-C", "link-args=-Wl,--gc-sections -Wl,-z,norelro"]
