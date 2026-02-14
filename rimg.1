@@ -1,4 +1,4 @@
-.TH RIMG 1 "2026-02-14" "rimg 0.1.0" "User Commands"
+.TH RIMG 1 "2026-02-14" "rimg 1.0.0" "User Commands"
 .SH NAME
 rimg \- minimal Wayland image viewer with vim keybindings
 .SH SYNOPSIS
@@ -12,14 +12,18 @@ rimg \- minimal Wayland image viewer with vim keybindings
 .SH DESCRIPTION
 .B rimg
 is a fast, lightweight image viewer for Wayland.
-It supports JPEG, PNG, GIF (animated), WebP, BMP, TIFF, and SVG formats.
+It supports JPEG, PNG, GIF (animated), WebP (including animated), BMP
+(1/4/8/24/32-bit), TIFF, and SVG formats.
 It features vim-style keybindings, a thumbnail gallery mode,
-zoom and pan, image rotation, and EXIF metadata display.
+zoom and pan, image rotation, EXIF metadata display, runtime sort cycling,
+and graceful error handling.
 .PP
 When given a directory,
 .B rimg
 recursively scans it for supported image files.
-Files are sorted by filename.
+Files are sorted by filename by default; press
+.B s
+to cycle through sort modes (Name, Size, EXIF Date, Modification Time).
 .PP
 With the
 .B \-w
@@ -75,7 +79,11 @@ Rotate clockwise 90 degrees.
 Rotate counterclockwise 90 degrees.
 .TP
 .B e
-Toggle EXIF info overlay (JPEG only).
+Toggle EXIF info overlay (JPEG, TIFF, WebP, PNG).
+.TP
+.B s
+Cycle sort mode (Name, Size, EXIF Date, Modification Time).
+A brief toast overlay shows the current sort mode.
 .TP
 .B f
 Toggle fullscreen.
@@ -96,6 +104,9 @@ First image.
 .B G
 Last image.
 .TP
+.B s
+Cycle sort mode.
+.TP
 .B Enter
 Open selected image in viewer.
 .TP
@@ -105,9 +116,13 @@ Quit.
 .B Escape
 Return to viewer mode.
 .SH SUPPORTED FORMATS
-JPEG, PNG, GIF (animated), WebP, BMP, TIFF, SVG.
+JPEG, PNG, GIF (animated), WebP (including animated), BMP (1/4/8/24/32-bit),
+TIFF, SVG.
 .PP
-EXIF orientation is automatically applied when loading JPEG images.
+EXIF orientation is automatically applied when loading JPEG, TIFF, WebP,
+and PNG images.
+Corrupt or unsupported files are automatically skipped with a brief
+error message in the status bar.
 .SH ENVIRONMENT
 .B rimg
 requires a running Wayland compositor.

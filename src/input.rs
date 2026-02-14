@@ -50,6 +50,9 @@ pub enum Action {
     MoveDown,
     GalleryFirst,
     GalleryLast,
+
+    // Global actions
+    CycleSort,
 }
 
 /// Application mode.
@@ -77,6 +80,7 @@ pub fn map_key(event: &KeyEvent, mode: Mode) -> Option<Action> {
         keysyms::q => return Some(Action::Quit),
         keysyms::Escape => return Some(Action::EscapeOrQuit),
         keysyms::Return => return Some(Action::ToggleMode),
+        keysyms::s => return Some(Action::CycleSort),
         _ => {}
     }
 
@@ -144,5 +148,138 @@ fn map_gallery_key(sym: u32) -> Option<Action> {
         keysyms::g => Some(Action::GalleryFirst),
         keysyms::G => Some(Action::GalleryLast),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wayland::KeyEvent;
+
+    fn press(keysym: u32) -> KeyEvent {
+        KeyEvent {
+            keycode: 0,
+            keysym,
+            pressed: true,
+            ctrl: false,
+            shift: false,
+        }
+    }
+
+    fn release(keysym: u32) -> KeyEvent {
+        KeyEvent {
+            keycode: 0,
+            keysym,
+            pressed: false,
+            ctrl: false,
+            shift: false,
+        }
+    }
+
+    #[test]
+    fn test_quit_viewer() {
+        let action = map_key(&press(keysyms::q), Mode::Viewer);
+        assert_eq!(action, Some(Action::Quit));
+    }
+
+    #[test]
+    fn test_quit_gallery() {
+        let action = map_key(&press(keysyms::q), Mode::Gallery);
+        assert_eq!(action, Some(Action::Quit));
+    }
+
+    #[test]
+    fn test_escape() {
+        let action = map_key(&press(keysyms::Escape), Mode::Viewer);
+        assert_eq!(action, Some(Action::EscapeOrQuit));
+    }
+
+    #[test]
+    fn test_toggle_mode() {
+        let action = map_key(&press(keysyms::Return), Mode::Viewer);
+        assert_eq!(action, Some(Action::ToggleMode));
+    }
+
+    #[test]
+    fn test_cycle_sort() {
+        let action = map_key(&press(keysyms::s), Mode::Viewer);
+        assert_eq!(action, Some(Action::CycleSort));
+        let action = map_key(&press(keysyms::s), Mode::Gallery);
+        assert_eq!(action, Some(Action::CycleSort));
+    }
+
+    #[test]
+    fn test_viewer_next_image() {
+        let action = map_key(&press(keysyms::n), Mode::Viewer);
+        assert_eq!(action, Some(Action::NextImage));
+    }
+
+    #[test]
+    fn test_viewer_pan() {
+        let action = map_key(&press(keysyms::h), Mode::Viewer);
+        assert_eq!(action, Some(Action::PanStart(PanDirection::Left)));
+        let action = map_key(&press(keysyms::j), Mode::Viewer);
+        assert_eq!(action, Some(Action::PanStart(PanDirection::Down)));
+    }
+
+    #[test]
+    fn test_gallery_move_down() {
+        let action = map_key(&press(keysyms::j), Mode::Gallery);
+        assert_eq!(action, Some(Action::MoveDown));
+    }
+
+    #[test]
+    fn test_gallery_move_left() {
+        let action = map_key(&press(keysyms::h), Mode::Gallery);
+        assert_eq!(action, Some(Action::MoveLeft));
+    }
+
+    #[test]
+    fn test_gallery_first_last() {
+        let action = map_key(&press(keysyms::g), Mode::Gallery);
+        assert_eq!(action, Some(Action::GalleryFirst));
+        let action = map_key(&press(keysyms::G), Mode::Gallery);
+        assert_eq!(action, Some(Action::GalleryLast));
+    }
+
+    #[test]
+    fn test_viewer_zoom() {
+        let action = map_key(&press(keysyms::plus), Mode::Viewer);
+        assert_eq!(action, Some(Action::ZoomIn));
+        let action = map_key(&press(keysyms::minus), Mode::Viewer);
+        assert_eq!(action, Some(Action::ZoomOut));
+    }
+
+    #[test]
+    fn test_viewer_rotate() {
+        let action = map_key(&press(keysyms::r), Mode::Viewer);
+        assert_eq!(action, Some(Action::RotateCW));
+        let action = map_key(&press(keysyms::R), Mode::Viewer);
+        assert_eq!(action, Some(Action::RotateCCW));
+    }
+
+    #[test]
+    fn test_unmapped_key() {
+        let action = map_key(&press(keysyms::z), Mode::Viewer);
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn test_release_ignored_gallery() {
+        let action = map_key(&release(keysyms::j), Mode::Gallery);
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn test_viewer_key_release_pan_stop() {
+        let ev = KeyEvent {
+            keycode: KEY_H,
+            keysym: keysyms::h,
+            pressed: false,
+            ctrl: false,
+            shift: false,
+        };
+        let action = map_key(&ev, Mode::Viewer);
+        assert_eq!(action, Some(Action::PanStop(PanDirection::Left)));
     }
 }

@@ -348,6 +348,12 @@ pub fn draw_overlay_rounded(
     }
 }
 
+/// Check if a pixel at the given position in an XRGB buffer has a specific color.
+#[cfg(test)]
+fn xrgb_at(buf: &[u32], buf_w: u32, x: u32, y: u32) -> u32 {
+    buf[(y * buf_w + x) as usize]
+}
+
 /// Blit an RGBA thumbnail onto an XRGB buffer at position (dx, dy), centered within
 /// a cell of (cell_w, cell_h).
 pub fn blit_thumbnail(
@@ -392,6 +398,107 @@ pub fn blit_thumbnail(
                 let out_b = (b * a + bg_b * (255 - a)) / 255;
                 buf[dst] = (out_r << 16) | (out_g << 8) | out_b;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image_loader::RgbaImage;
+
+    #[test]
+    fn test_scale_to_fit_dimensions() {
+        // 100x50 image into 50x50 -> should be 50x25
+        let img = RgbaImage::new(100, 50);
+        let scaled = scale_to_fit(&img, 50, 50);
+        assert_eq!(scaled.dimensions(), (50, 25));
+    }
+
+    #[test]
+    fn test_scale_to_fit_tall() {
+        // 50x100 image into 50x50 -> should be 25x50
+        let img = RgbaImage::new(50, 100);
+        let scaled = scale_to_fit(&img, 50, 50);
+        assert_eq!(scaled.dimensions(), (25, 50));
+    }
+
+    #[test]
+    fn test_scale_to_fit_already_fits() {
+        // 10x10 into 100x100 -> 100x100 (scales up)
+        let img = RgbaImage::new(10, 10);
+        let scaled = scale_to_fit(&img, 100, 100);
+        assert_eq!(scaled.dimensions(), (100, 100));
+    }
+
+    #[test]
+    fn test_scale_to_fit_zero() {
+        let img = RgbaImage::new(10, 10);
+        let scaled = scale_to_fit(&img, 0, 0);
+        assert_eq!(scaled.dimensions(), (1, 1));
+    }
+
+    #[test]
+    fn test_composite_centered_opaque() {
+        // 2x2 red image centered on 4x4 canvas
+        let mut img = RgbaImage::new(2, 2);
+        for i in 0..4 {
+            img.data[i * 4] = 255; // R
+            img.data[i * 4 + 1] = 0; // G
+            img.data[i * 4 + 2] = 0; // B
+            img.data[i * 4 + 3] = 255; // A
+        }
+
+        let buf = composite_centered(&img, 4, 4, 0, 0);
+        assert_eq!(buf.len(), 16);
+        // Center of 4x4 with 2x2: at (1,1)
+        let red = (255 << 16) | (0 << 8) | 0;
+        assert_eq!(xrgb_at(&buf, 4, 1, 1), red);
+        assert_eq!(xrgb_at(&buf, 4, 2, 1), red);
+        assert_eq!(xrgb_at(&buf, 4, 1, 2), red);
+        assert_eq!(xrgb_at(&buf, 4, 2, 2), red);
+        // Corners should be background
+        assert_eq!(xrgb_at(&buf, 4, 0, 0), BG_COLOR);
+        assert_eq!(xrgb_at(&buf, 4, 3, 3), BG_COLOR);
+    }
+
+    #[test]
+    fn test_composite_centered_alpha_blend() {
+        // 1x1 semi-transparent image (alpha=128)
+        let mut img = RgbaImage::new(1, 1);
+        img.data[0] = 255; // R
+        img.data[1] = 0; // G
+        img.data[2] = 0; // B
+        img.data[3] = 128; // A (about 50%)
+
+        let buf = composite_centered(&img, 1, 1, 0, 0);
+        // Should be a blend of red over BG_COLOR (#1a1a1a)
+        let pixel = buf[0];
+        let r = (pixel >> 16) & 0xFF;
+        let g = (pixel >> 8) & 0xFF;
+        let b = pixel & 0xFF;
+        // Expected: R = (255*128 + 0x1a*(255-128))/255 ≈ 140
+        assert!(r > 100, "Expected reddish blend, got r={}", r);
+        assert!(g < 20, "Expected low green, got g={}", g);
+        assert!(b < 20, "Expected low blue, got b={}", b);
+    }
+
+    #[test]
+    fn test_fill_rect() {
+        let mut buf = vec![0u32; 9]; // 3x3
+        fill_rect(&mut buf, 3, 1, 1, 1, 1, 0x00FF0000);
+        assert_eq!(buf[4], 0x00FF0000); // center pixel
+        assert_eq!(buf[0], 0); // corner unchanged
+    }
+
+    #[test]
+    fn test_draw_overlay_darkens() {
+        let mut buf = vec![0x00FFFFFF; 4]; // 2x2 white
+        draw_overlay(&mut buf, 2, 0, 0, 2, 2, 128); // ~50% dark overlay
+        for &px in &buf {
+            let r = (px >> 16) & 0xFF;
+            // White (255) with 50% dark overlay: ~127
+            assert!(r < 160 && r > 90, "Expected dimmed, got r={}", r);
         }
     }
 }

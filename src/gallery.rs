@@ -71,6 +71,12 @@ impl Gallery {
         self.selected = index;
     }
 
+    /// Clear cached thumbnails so they are re-generated from current paths order.
+    pub fn invalidate_thumbnails(&mut self) {
+        self.thumbnails.clear();
+        self.pending.clear();
+    }
+
     fn cell_size() -> u32 {
         THUMB_SIZE + GAP
     }
@@ -263,5 +269,117 @@ impl Gallery {
         }
 
         buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gallery_with_cols(cols: usize) -> Gallery {
+        let mut g = Gallery::new();
+        g.cols = cols;
+        g
+    }
+
+    #[test]
+    fn test_move_right_basic() {
+        let mut g = gallery_with_cols(3);
+        g.selected = 0;
+        g.move_right(10);
+        assert_eq!(g.selected, 1);
+    }
+
+    #[test]
+    fn test_move_right_at_end() {
+        let mut g = gallery_with_cols(3);
+        g.selected = 9; // last item
+        g.move_right(10);
+        assert_eq!(g.selected, 9); // stays
+    }
+
+    #[test]
+    fn test_move_left_basic() {
+        let mut g = gallery_with_cols(3);
+        g.selected = 5;
+        g.move_left(10);
+        assert_eq!(g.selected, 4);
+    }
+
+    #[test]
+    fn test_move_left_at_zero() {
+        let mut g = gallery_with_cols(3);
+        g.selected = 0;
+        g.move_left(10);
+        assert_eq!(g.selected, 0); // stays
+    }
+
+    #[test]
+    fn test_move_down_basic() {
+        let mut g = gallery_with_cols(3);
+        g.selected = 1; // row 0, col 1
+        g.move_down(10);
+        assert_eq!(g.selected, 4); // row 1, col 1
+    }
+
+    #[test]
+    fn test_move_down_last_row() {
+        let mut g = gallery_with_cols(3);
+        g.selected = 7; // row 2 (items 6,7,8), col 1
+        g.move_down(9); // total=9, 7+3=10 >= 9
+        assert_eq!(g.selected, 7); // stays
+    }
+
+    #[test]
+    fn test_move_up_basic() {
+        let mut g = gallery_with_cols(3);
+        g.selected = 4; // row 1, col 1
+        g.move_up(10);
+        assert_eq!(g.selected, 1); // row 0, col 1
+    }
+
+    #[test]
+    fn test_move_up_top_row() {
+        let mut g = gallery_with_cols(3);
+        g.selected = 1; // already top row
+        g.move_up(10);
+        assert_eq!(g.selected, 1); // stays (1 < 3=cols)
+    }
+
+    #[test]
+    fn test_go_first() {
+        let mut g = gallery_with_cols(3);
+        g.selected = 7;
+        g.scroll_y = 100;
+        g.go_first();
+        assert_eq!(g.selected, 0);
+        assert_eq!(g.scroll_y, 0);
+    }
+
+    #[test]
+    fn test_go_last() {
+        let mut g = gallery_with_cols(3);
+        g.selected = 0;
+        g.go_last(10);
+        assert_eq!(g.selected, 9);
+    }
+
+    #[test]
+    fn test_go_last_empty() {
+        let mut g = gallery_with_cols(3);
+        g.go_last(0);
+        assert_eq!(g.selected, 0); // unchanged
+    }
+
+    #[test]
+    fn test_move_empty() {
+        let mut g = gallery_with_cols(3);
+        g.selected = 0;
+        g.move_right(0);
+        assert_eq!(g.selected, 0);
+        g.move_left(0);
+        assert_eq!(g.selected, 0);
+        g.move_down(0);
+        assert_eq!(g.selected, 0);
     }
 }

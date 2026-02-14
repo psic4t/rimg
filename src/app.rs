@@ -6,8 +6,42 @@ use crate::wayland::{WaylandEvent, WaylandState};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use wayland_client::Connection;
+
+/// Duration to show transient error messages in the status bar.
+const ERROR_DISPLAY_DURATION: Duration = Duration::from_secs(3);
+/// Duration to show the sort mode toast overlay.
+const TOAST_DISPLAY_DURATION: Duration = Duration::from_millis(1500);
+
+/// Sort mode for image list ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    Name,
+    Size,
+    ExifDate,
+    ModTime,
+}
+
+impl SortMode {
+    fn next(self) -> Self {
+        match self {
+            SortMode::Name => SortMode::Size,
+            SortMode::Size => SortMode::ExifDate,
+            SortMode::ExifDate => SortMode::ModTime,
+            SortMode::ModTime => SortMode::Name,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::Name => "Name",
+            SortMode::Size => "Size",
+            SortMode::ExifDate => "EXIF Date",
+            SortMode::ModTime => "Mod Time",
+        }
+    }
+}
 
 pub struct App {
     state: WaylandState,
@@ -22,6 +56,20 @@ pub struct App {
     win_h: u32,
     needs_redraw: bool,
     wallpaper_mode: bool,
+    /// Transient error message for the status bar (auto-dismissed).
+    error_message: Option<String>,
+    /// Deadline after which the error message should be cleared.
+    error_deadline: Option<Instant>,
+    /// Current sort mode.
+    sort_mode: SortMode,
+    /// Toast overlay message (e.g., "Sort: Name").
+    toast_message: Option<String>,
+    /// Deadline after which the toast should be cleared.
+    toast_deadline: Option<Instant>,
+    /// Cached file metadata: path -> (size_bytes, mtime_secs).
+    meta_cache: HashMap<PathBuf, (u64, u64)>,
+    /// Cached EXIF dates: path -> Option<timestamp_secs>.
+    exif_date_cache: HashMap<PathBuf, Option<u64>>,
 }
 
 impl App {
@@ -42,6 +90,13 @@ impl App {
             win_h: 0,
             needs_redraw: true,
             wallpaper_mode,
+            error_message: None,
+            error_deadline: None,
+            sort_mode: SortMode::Name,
+            toast_message: None,
+            toast_deadline: None,
+            meta_cache: HashMap::new(),
+            exif_date_cache: HashMap::new(),
         }
     }
 
@@ -88,37 +143,70 @@ impl App {
             // Flush outgoing messages
             let _ = self.conn.flush();
 
-            // Calculate poll timeout based on GIF animation, pan animation, or pending thumbnails
-            let timeout_ms = if self.mode == Mode::Viewer {
+            // Calculate poll timeout based on GIF animation, pan animation, error dismiss, or pending thumbnails
+            let timeout_ms = {
                 let now = Instant::now();
-                let gif_timeout = if let Some(deadline) = self.viewer.next_frame_deadline() {
-                    if deadline > now {
+                let mut min_timeout: i32 = -1;
+
+                // Error message auto-dismiss deadline
+                if let Some(deadline) = self.error_deadline {
+                    let t = if deadline > now {
                         deadline.duration_since(now).as_millis() as i32
                     } else {
                         0
-                    }
-                } else {
-                    -1
-                };
-                let pan_timeout = if let Some(deadline) = self.viewer.pan_deadline() {
-                    if deadline > now {
-                        deadline.duration_since(now).as_millis() as i32
-                    } else {
-                        0
-                    }
-                } else {
-                    -1
-                };
-                // Use the smallest non-negative timeout, or -1 if both are indefinite
-                match (gif_timeout, pan_timeout) {
-                    (-1, -1) => -1,
-                    (-1, t) | (t, -1) => t,
-                    (a, b) => a.min(b),
+                    };
+                    min_timeout = t;
                 }
-            } else if self.mode == Mode::Gallery && self.gallery.has_pending() {
-                16 // Poll at ~60fps while thumbnails are being generated
-            } else {
-                -1
+
+                // Toast auto-dismiss deadline
+                if let Some(deadline) = self.toast_deadline {
+                    let t = if deadline > now {
+                        deadline.duration_since(now).as_millis() as i32
+                    } else {
+                        0
+                    };
+                    min_timeout = if min_timeout < 0 {
+                        t
+                    } else {
+                        min_timeout.min(t)
+                    };
+                }
+
+                if self.mode == Mode::Viewer {
+                    if let Some(deadline) = self.viewer.next_frame_deadline() {
+                        let t = if deadline > now {
+                            deadline.duration_since(now).as_millis() as i32
+                        } else {
+                            0
+                        };
+                        min_timeout = if min_timeout < 0 {
+                            t
+                        } else {
+                            min_timeout.min(t)
+                        };
+                    }
+                    if let Some(deadline) = self.viewer.pan_deadline() {
+                        let t = if deadline > now {
+                            deadline.duration_since(now).as_millis() as i32
+                        } else {
+                            0
+                        };
+                        min_timeout = if min_timeout < 0 {
+                            t
+                        } else {
+                            min_timeout.min(t)
+                        };
+                    }
+                } else if self.mode == Mode::Gallery && self.gallery.has_pending() {
+                    let t = 16; // Poll at ~60fps while thumbnails are being generated
+                    min_timeout = if min_timeout < 0 {
+                        t
+                    } else {
+                        min_timeout.min(t)
+                    };
+                }
+
+                min_timeout
             };
 
             // Poll the wayland fd
@@ -187,6 +275,24 @@ impl App {
             // Handle pan animation
             if self.mode == Mode::Viewer {
                 if self.viewer.update_pan() {
+                    self.needs_redraw = true;
+                }
+            }
+
+            // Handle error message auto-dismiss
+            if let Some(deadline) = self.error_deadline {
+                if Instant::now() >= deadline {
+                    self.error_message = None;
+                    self.error_deadline = None;
+                    self.needs_redraw = true;
+                }
+            }
+
+            // Handle toast auto-dismiss
+            if let Some(deadline) = self.toast_deadline {
+                if Instant::now() >= deadline {
+                    self.toast_message = None;
+                    self.toast_deadline = None;
                     self.needs_redraw = true;
                 }
             }
@@ -303,23 +409,58 @@ impl App {
     }
 
     fn ensure_image_loaded(&mut self) {
-        if self.paths.is_empty() {
-            return;
-        }
-        let idx = self.current_index;
-        if self.image_cache.contains_key(&idx) {
-            return;
-        }
-        match image_loader::load_image(&self.paths[idx]) {
-            Ok(loaded) => {
-                self.image_cache.insert(idx, loaded);
+        // Try loading the current image; if it fails, remove it and advance.
+        // Loop in case multiple consecutive images fail.
+        while !self.paths.is_empty() {
+            let idx = self.current_index;
+            if self.image_cache.contains_key(&idx) {
+                return;
             }
-            Err(e) => {
-                eprintln!(
-                    "Warning: failed to load {}: {}",
-                    self.paths[idx].display(),
-                    e
-                );
+            match image_loader::load_image(&self.paths[idx]) {
+                Ok(loaded) => {
+                    self.image_cache.insert(idx, loaded);
+                    return;
+                }
+                Err(e) => {
+                    let name = self.paths[idx]
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    eprintln!(
+                        "Warning: failed to load {}: {}",
+                        self.paths[idx].display(),
+                        e
+                    );
+
+                    // Remove the failed path and adjust indices
+                    self.paths.remove(idx);
+                    // Shift any cached entries above this index down by one
+                    let mut new_cache = HashMap::new();
+                    for (k, v) in self.image_cache.drain() {
+                        if k < idx {
+                            new_cache.insert(k, v);
+                        } else if k > idx {
+                            new_cache.insert(k - 1, v);
+                        }
+                        // k == idx was the failed one (shouldn't be cached, but skip)
+                    }
+                    self.image_cache = new_cache;
+
+                    if self.paths.is_empty() {
+                        self.error_message = Some("No valid images".to_string());
+                        self.error_deadline = Some(Instant::now() + ERROR_DISPLAY_DURATION);
+                        return;
+                    }
+                    // Clamp current_index
+                    if self.current_index >= self.paths.len() {
+                        self.current_index = 0;
+                    }
+                    // Set error message
+                    self.error_message = Some(format!("Skipped: {}", name));
+                    self.error_deadline = Some(Instant::now() + ERROR_DISPLAY_DURATION);
+                    // Continue loop to try the next image
+                }
             }
         }
     }
@@ -330,6 +471,9 @@ impl App {
         }
         self.current_index = index % self.paths.len();
         self.viewer.reset_view();
+        // Clear any transient error when user explicitly navigates
+        self.error_message = None;
+        self.error_deadline = None;
         self.ensure_image_loaded();
 
         if let Some(loaded) = self.image_cache.get(&self.current_index) {
@@ -348,17 +492,22 @@ impl App {
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if ext == "jpg" || ext == "jpeg" {
-                // Only read EXIF from reasonably-sized files (64 MiB limit for metadata)
-                let too_large = std::fs::metadata(path)
-                    .map(|m| m.len() > 64 * 1024 * 1024)
-                    .unwrap_or(true);
-                if !too_large {
-                    if let Ok(data) = std::fs::read(path) {
-                        let tags = image_loader::read_exif_tags(&data);
-                        self.viewer.set_exif_data(tags);
-                        return;
-                    }
+
+            // Only read EXIF from reasonably-sized files (64 MiB limit for metadata)
+            let too_large = std::fs::metadata(path)
+                .map(|m| m.len() > 64 * 1024 * 1024)
+                .unwrap_or(true);
+            if !too_large {
+                if let Ok(data) = std::fs::read(path) {
+                    let tags = match ext.as_str() {
+                        "jpg" | "jpeg" => image_loader::read_exif_tags(&data),
+                        "tiff" | "tif" => image_loader::read_exif_tags_tiff(&data),
+                        "webp" => image_loader::read_exif_tags_webp(&data),
+                        "png" => image_loader::read_exif_tags_png(&data),
+                        _ => Vec::new(),
+                    };
+                    self.viewer.set_exif_data(tags);
+                    return;
                 }
             }
             self.viewer.set_exif_data(Vec::new());
@@ -379,7 +528,14 @@ impl App {
 
         let pixels = match self.mode {
             Mode::Viewer => {
-                if let Some(loaded) = self.image_cache.get(&self.current_index) {
+                if self.paths.is_empty() {
+                    // No valid images remain — show background with error message
+                    let mut buf = vec![crate::render::BG_COLOR; (self.win_w * self.win_h) as usize];
+                    if let Some(ref msg) = self.error_message {
+                        crate::status::draw_status_bar(&mut buf, self.win_w, self.win_h, msg);
+                    }
+                    buf
+                } else if let Some(loaded) = self.image_cache.get(&self.current_index) {
                     self.viewer.render(
                         loaded,
                         self.win_w,
@@ -387,12 +543,20 @@ impl App {
                         &self.paths[self.current_index],
                         self.current_index,
                         self.paths.len(),
+                        self.error_message.as_deref(),
+                        self.toast_message.as_deref(),
                     )
                 } else {
                     vec![crate::render::BG_COLOR; (self.win_w * self.win_h) as usize]
                 }
             }
-            Mode::Gallery => self.gallery.render(&self.paths, self.win_w, self.win_h),
+            Mode::Gallery => {
+                let mut buf = self.gallery.render(&self.paths, self.win_w, self.win_h);
+                if let Some(ref msg) = self.toast_message {
+                    crate::viewer::Viewer::draw_toast(&mut buf, self.win_w, self.win_h, msg);
+                }
+                buf
+            }
         };
 
         if pixels.is_empty() {
@@ -577,9 +741,162 @@ impl App {
                 self.gallery.go_last(self.paths.len());
                 self.needs_redraw = true;
             }
+            Action::CycleSort => {
+                self.cycle_sort();
+                self.ensure_image_loaded();
+                self.needs_redraw = true;
+            }
         }
         false
     }
+
+    /// Cycle to the next sort mode, re-sort paths, and show a toast.
+    fn cycle_sort(&mut self) {
+        if self.paths.is_empty() {
+            return;
+        }
+
+        // Remember current image path and old index to re-find it after sort
+        let current_path = self.paths.get(self.current_index).cloned();
+        let old_index = self.current_index;
+
+        self.sort_mode = self.sort_mode.next();
+
+        // Sort paths according to the new mode
+        // We pre-populate caches then sort using them to avoid borrow conflicts.
+        match self.sort_mode {
+            SortMode::Name => {
+                self.paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+            }
+            SortMode::Size => {
+                // Ensure all metadata is cached first
+                for p in &self.paths {
+                    if !self.meta_cache.contains_key(p) {
+                        let meta = read_file_meta(p);
+                        self.meta_cache.insert(p.clone(), meta);
+                    }
+                }
+                let cache = &self.meta_cache;
+                self.paths
+                    .sort_by_cached_key(|p| cache.get(p).map(|m| m.0).unwrap_or(0));
+            }
+            SortMode::ModTime => {
+                for p in &self.paths {
+                    if !self.meta_cache.contains_key(p) {
+                        let meta = read_file_meta(p);
+                        self.meta_cache.insert(p.clone(), meta);
+                    }
+                }
+                let cache = &self.meta_cache;
+                self.paths
+                    .sort_by_cached_key(|p| cache.get(p).map(|m| m.1).unwrap_or(0));
+            }
+            SortMode::ExifDate => {
+                // Pre-populate both metadata and EXIF date caches
+                for p in &self.paths {
+                    if !self.meta_cache.contains_key(p) {
+                        let meta = read_file_meta(p);
+                        self.meta_cache.insert(p.clone(), meta);
+                    }
+                    if !self.exif_date_cache.contains_key(p) {
+                        let ext = p
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        let exif_ts = if ext == "jpg" || ext == "jpeg" {
+                            parse_exif_date_original(p)
+                        } else {
+                            None
+                        };
+                        self.exif_date_cache.insert(p.clone(), exif_ts);
+                    }
+                }
+                let meta_cache = &self.meta_cache;
+                let exif_cache = &self.exif_date_cache;
+                self.paths.sort_by_cached_key(|p| {
+                    exif_cache
+                        .get(p)
+                        .and_then(|v| *v)
+                        .unwrap_or_else(|| meta_cache.get(p).map(|m| m.1).unwrap_or(0))
+                });
+            }
+        }
+
+        // Re-find the current image in the sorted list
+        if let Some(ref path) = current_path {
+            if let Some(pos) = self.paths.iter().position(|p| p == path) {
+                self.current_index = pos;
+            }
+        }
+
+        // Remap the cached image from old index to new index
+        if old_index != self.current_index {
+            if let Some(loaded) = self.image_cache.remove(&old_index) {
+                self.image_cache.clear();
+                self.image_cache.insert(self.current_index, loaded);
+            }
+        }
+
+        // Update gallery: reset selection and invalidate stale thumbnail cache
+        self.gallery.set_selected(self.current_index);
+        self.gallery.invalidate_thumbnails();
+
+        // Show toast
+        self.toast_message = Some(format!("Sort: {}", self.sort_mode.label()));
+        self.toast_deadline = Some(Instant::now() + TOAST_DISPLAY_DURATION);
+    }
+}
+
+/// Read file size and modification time. Returns (size_bytes, mtime_secs).
+fn read_file_meta(path: &PathBuf) -> (u64, u64) {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let size = meta.len();
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (size, mtime)
+        }
+        Err(_) => (0, 0),
+    }
+}
+
+/// Parse EXIF DateTimeOriginal from a JPEG file, returning a Unix timestamp.
+fn parse_exif_date_original(path: &PathBuf) -> Option<u64> {
+    let data = std::fs::read(path).ok()?;
+    let tags = image_loader::read_exif_tags(&data);
+    for (label, value) in &tags {
+        if label == "Date Original" || label == "Date/Time" {
+            // EXIF date format: "YYYY:MM:DD HH:MM:SS"
+            return parse_exif_datetime(value);
+        }
+    }
+    None
+}
+
+/// Parse "YYYY:MM:DD HH:MM:SS" into a rough Unix timestamp (seconds since epoch).
+fn parse_exif_datetime(s: &str) -> Option<u64> {
+    // "2024:01:15 14:30:00" -> parse as approximate seconds
+    let parts: Vec<&str> = s.split(|c: char| c == ':' || c == ' ').collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    let year: u64 = parts[0].parse().ok()?;
+    let month: u64 = parts[1].parse().ok()?;
+    let day: u64 = parts[2].parse().ok()?;
+    let hour: u64 = parts[3].parse().ok()?;
+    let min: u64 = parts[4].parse().ok()?;
+    let sec: u64 = parts[5].parse().ok()?;
+    if year < 1970 || month == 0 || month > 12 || day == 0 || day > 31 {
+        return None;
+    }
+    // Approximate days since epoch (good enough for sorting)
+    let days_approx = (year - 1970) * 365 + (year - 1969) / 4 + (month - 1) * 30 + day;
+    Some(days_approx * 86400 + hour * 3600 + min * 60 + sec)
 }
 
 /// Convert an RgbaImage to a Vec<u32> XRGB8888 pixel buffer.

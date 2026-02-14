@@ -285,6 +285,8 @@ impl Viewer {
         path: &Path,
         index: usize,
         total: usize,
+        error_message: Option<&str>,
+        toast_message: Option<&str>,
     ) -> Vec<u32> {
         if win_w == 0 || win_h == 0 {
             return vec![];
@@ -340,8 +342,16 @@ impl Viewer {
         // Composite onto background
         let mut buf = render::composite_centered(&scaled, win_w, win_h, self.pan_x, self.pan_y);
 
-        // Draw status bar
-        let status_text = status::format_status(path, src_w, src_h, index, total);
+        // Draw status bar (with error message appended if present)
+        let status_text = if let Some(err) = error_message {
+            format!(
+                "{} | {}",
+                status::format_status(path, src_w, src_h, index, total),
+                err
+            )
+        } else {
+            status::format_status(path, src_w, src_h, index, total)
+        };
         status::draw_status_bar(&mut buf, win_w, win_h, &status_text);
 
         // Draw EXIF overlay
@@ -349,7 +359,34 @@ impl Viewer {
             self.draw_exif_overlay(&mut buf, win_w, win_h);
         }
 
+        // Draw toast overlay
+        if let Some(msg) = toast_message {
+            Self::draw_toast(&mut buf, win_w, win_h, msg);
+        }
+
         buf
+    }
+
+    /// Draw a small toast notification at the top-right corner.
+    pub(crate) fn draw_toast(buf: &mut [u32], win_w: u32, win_h: u32, message: &str) {
+        let padding: u32 = 6;
+        let margin: u32 = 10;
+        let radius: u32 = 4;
+
+        let text_w = message.len() as u32 * font::GLYPH_W;
+        let overlay_w = text_w + padding * 2;
+        let overlay_h = font::GLYPH_H + padding * 2;
+
+        let overlay_x = win_w.saturating_sub(overlay_w + margin);
+        let overlay_y = margin;
+
+        render::draw_overlay_rounded(
+            buf, win_w, overlay_x, overlay_y, overlay_w, overlay_h, 180, radius,
+        );
+
+        let text_x = overlay_x + padding;
+        let text_y = overlay_y + padding;
+        font::draw_string(buf, win_w, win_h, message, text_x, text_y, 0x00DDDDDD);
     }
 
     fn draw_exif_overlay(&self, buf: &mut [u32], win_w: u32, win_h: u32) {

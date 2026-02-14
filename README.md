@@ -12,9 +12,12 @@ wlr-layer-shell protocol.
 - Vim-style keybindings for navigation
 - Viewer mode with zoom, pan, and rotation
 - Gallery mode with thumbnail grid
-- Animated GIF playback
-- EXIF metadata overlay (JPEG)
-- Automatic EXIF orientation correction
+- Animated GIF and WebP playback
+- EXIF metadata overlay (JPEG, TIFF, WebP, PNG)
+- Automatic EXIF orientation correction (JPEG, TIFF, WebP, PNG)
+- Runtime sort cycling (name, size, EXIF date, modification time)
+- Graceful error handling: corrupt/unsupported images are auto-skipped
+- BMP support for 1-bit, 4-bit, and 8-bit indexed color
 - Wallpaper mode for wlroots compositors (sway, Hyprland, dwl, etc.)
 - Bilinear image scaling
 - Embedded bitmap font (no external font dependencies)
@@ -125,6 +128,7 @@ rimg -w wallpaper.jpg
 | `r` | Rotate clockwise 90 degrees |
 | `R` | Rotate counterclockwise 90 degrees |
 | `e` | Toggle EXIF info overlay |
+| `s` | Cycle sort mode (Name / Size / EXIF Date / Mod Time) |
 | `f` | Toggle fullscreen |
 | `Enter` | Enter gallery mode |
 | `q` / `Escape` | Quit |
@@ -136,6 +140,7 @@ rimg -w wallpaper.jpg
 | `h/j/k/l` | Navigate thumbnail grid (also arrow keys) |
 | `g` | First image |
 | `G` | Last image |
+| `s` | Cycle sort mode |
 | `Enter` | Open selected image |
 | `q` | Quit |
 | `Escape` | Return to viewer mode |

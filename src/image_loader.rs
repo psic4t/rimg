@@ -20,7 +20,7 @@ const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
 const MAX_DIR_DEPTH: u32 = 64;
 
 /// Simple RGBA image buffer.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RgbaImage {
     pub data: Vec<u8>,
     pub width: u32,
@@ -65,6 +65,7 @@ impl RgbaImage {
 }
 
 /// A loaded image — either static or animated.
+#[derive(Debug)]
 pub enum LoadedImage {
     Static(RgbaImage),
     Animated { frames: Vec<(RgbaImage, Duration)> },
@@ -425,8 +426,13 @@ fn load_png(path: &Path) -> Result<LoadedImage, String> {
         let mut ip = info_ptr;
         libpng::png_destroy_read_struct(&mut pp, &mut ip, std::ptr::null_mut());
 
-        let img = RgbaImage::from_raw(width, height, rgba_data)
+        let mut img = RgbaImage::from_raw(width, height, rgba_data)
             .ok_or_else(|| "PNG pixel buffer size mismatch".to_string())?;
+
+        // Apply EXIF orientation from PNG eXIf chunk
+        if let Some(orientation) = read_exif_orientation_png(&data) {
+            img = apply_orientation(img, orientation);
+        }
 
         Ok(LoadedImage::Static(img))
     }
@@ -439,6 +445,18 @@ fn load_png(path: &Path) -> Result<LoadedImage, String> {
 fn load_webp(path: &Path) -> Result<LoadedImage, String> {
     let data = read_file_limited(path)?;
 
+    // Check if the WebP is animated using WebPGetFeatures
+    let mut features: libwebp_sys::WebPBitstreamFeatures = unsafe { std::mem::zeroed() };
+    let status = unsafe { libwebp_sys::WebPGetFeatures(data.as_ptr(), data.len(), &mut features) };
+    if status != libwebp_sys::VP8_STATUS_OK {
+        return Err(format!("Failed to read WebP features {}", path.display()));
+    }
+
+    if features.has_animation != 0 {
+        return load_webp_animated(&data, path);
+    }
+
+    // Static WebP: decode with WebPDecodeRGBA
     let mut width: std::ffi::c_int = 0;
     let mut height: std::ffi::c_int = 0;
 
@@ -449,7 +467,6 @@ fn load_webp(path: &Path) -> Result<LoadedImage, String> {
         return Err(format!("Failed to decode WebP {}", path.display()));
     }
 
-    // Validate dimensions: reject negative or zero values from libwebp
     if width <= 0 || height <= 0 {
         unsafe {
             libwebp_sys::WebPFree(ptr as *mut std::ffi::c_void);
@@ -471,17 +488,106 @@ fn load_webp(path: &Path) -> Result<LoadedImage, String> {
         e
     })?;
 
-    // Use u64 to prevent overflow in length calculation
     let len = w as u64 * h as u64 * 4;
     let rgba_data = unsafe { std::slice::from_raw_parts(ptr, len as usize).to_vec() };
     unsafe {
         libwebp_sys::WebPFree(ptr as *mut std::ffi::c_void);
     }
 
-    let img = RgbaImage::from_raw(w, h, rgba_data)
+    let mut img = RgbaImage::from_raw(w, h, rgba_data)
         .ok_or_else(|| "WebP pixel buffer size mismatch".to_string())?;
 
+    // Apply EXIF orientation from WebP EXIF chunk
+    if let Some(orientation) = read_exif_orientation_webp(&data) {
+        img = apply_orientation(img, orientation);
+    }
+
     Ok(LoadedImage::Static(img))
+}
+
+/// Decode an animated WebP using the WebPAnimDecoder API.
+fn load_webp_animated(data: &[u8], path: &Path) -> Result<LoadedImage, String> {
+    unsafe {
+        // Initialize decoder options
+        let mut options: libwebp_sys::WebPAnimDecoderOptions = std::mem::zeroed();
+        if libwebp_sys::WebPAnimDecoderOptionsInit(&mut options) == 0 {
+            return Err("WebPAnimDecoderOptionsInit failed".to_string());
+        }
+        options.color_mode = libwebp_sys::MODE_RGBA;
+        options.use_threads = 0;
+
+        // Create WebPData
+        let webp_data = libwebp_sys::WebPData {
+            bytes: data.as_ptr(),
+            size: data.len(),
+        };
+
+        // Create the animation decoder
+        let dec = libwebp_sys::WebPAnimDecoderNew(&webp_data, &options);
+        if dec.is_null() {
+            return Err(format!(
+                "Failed to create WebP animation decoder for {}",
+                path.display()
+            ));
+        }
+
+        // Get animation info (canvas size, frame count)
+        let mut info: libwebp_sys::WebPAnimInfo = std::mem::zeroed();
+        if libwebp_sys::WebPAnimDecoderGetInfo(dec, &mut info) == 0 {
+            libwebp_sys::WebPAnimDecoderDelete(dec);
+            return Err(format!(
+                "Failed to get WebP animation info for {}",
+                path.display()
+            ));
+        }
+
+        let canvas_w = info.canvas_width;
+        let canvas_h = info.canvas_height;
+        validate_dimensions(canvas_w, canvas_h, "WebP animated").map_err(|e| {
+            libwebp_sys::WebPAnimDecoderDelete(dec);
+            e
+        })?;
+
+        let frame_size = (canvas_w as u64 * canvas_h as u64 * 4) as usize;
+        let mut frames: Vec<(RgbaImage, Duration)> = Vec::new();
+        let mut prev_timestamp: i32 = 0;
+
+        // Iterate through all frames
+        while libwebp_sys::WebPAnimDecoderHasMoreFrames(dec) != 0 {
+            let mut buf: *mut u8 = std::ptr::null_mut();
+            let mut timestamp: std::ffi::c_int = 0;
+
+            if libwebp_sys::WebPAnimDecoderGetNext(dec, &mut buf, &mut timestamp) == 0 {
+                break; // Decode error on this frame, stop
+            }
+
+            // Frame duration = delta between consecutive cumulative timestamps
+            let delay_ms = ((timestamp - prev_timestamp) as u64).max(10);
+            prev_timestamp = timestamp;
+
+            // Copy the RGBA buffer (it's owned by the decoder, valid until next GetNext or Delete)
+            let rgba_data = std::slice::from_raw_parts(buf, frame_size).to_vec();
+            if let Some(img) = RgbaImage::from_raw(canvas_w, canvas_h, rgba_data) {
+                frames.push((img, Duration::from_millis(delay_ms)));
+            }
+        }
+
+        libwebp_sys::WebPAnimDecoderDelete(dec);
+
+        if frames.is_empty() {
+            return Err(format!(
+                "No frames decoded from animated WebP: {}",
+                path.display()
+            ));
+        }
+
+        if frames.len() == 1 {
+            let (img, _) = frames.into_iter().next().unwrap();
+            return Ok(LoadedImage::Static(img));
+        }
+
+        Ok(LoadedImage::Animated { frames })
+    }
 }
 
 // ============================================================
@@ -721,7 +827,11 @@ fn load_gif(path: &Path) -> Result<LoadedImage, String> {
 
 fn load_bmp(path: &Path) -> Result<LoadedImage, String> {
     let data = read_file_limited(path)?;
+    decode_bmp(&data, &path.display().to_string())
+}
 
+/// Decode a BMP image from raw bytes. Separated from load_bmp for testability.
+fn decode_bmp(data: &[u8], path_display: &str) -> Result<LoadedImage, String> {
     if data.len() < 54 {
         return Err("File too small to be BMP".to_string());
     }
@@ -731,9 +841,15 @@ fn load_bmp(path: &Path) -> Result<LoadedImage, String> {
     }
 
     let data_offset = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+    let dib_header_size = u32::from_le_bytes([data[14], data[15], data[16], data[17]]) as usize;
     let width = i32::from_le_bytes([data[18], data[19], data[20], data[21]]);
     let height = i32::from_le_bytes([data[22], data[23], data[24], data[25]]);
     let bits_per_pixel = u16::from_le_bytes([data[28], data[29]]);
+    let compression = if data.len() >= 34 {
+        u32::from_le_bytes([data[30], data[31], data[32], data[33]])
+    } else {
+        0
+    };
 
     if width <= 0 || height == 0 {
         return Err("Invalid BMP dimensions".to_string());
@@ -766,7 +882,7 @@ fn load_bmp(path: &Path) -> Result<LoadedImage, String> {
                     } else {
                         y as usize
                     };
-                    let src_idx = data_offset + (src_row * row_size as usize) + (x as usize * 3);
+                    let src_idx = data_offset + (src_row * row_size) + (x as usize * 3);
                     let dst = ((y * w + x) * 4) as usize;
                     rgba_data[dst] = data[src_idx + 2];
                     rgba_data[dst + 1] = data[src_idx + 1];
@@ -783,7 +899,7 @@ fn load_bmp(path: &Path) -> Result<LoadedImage, String> {
                     } else {
                         y as usize
                     };
-                    let src_idx = data_offset + (src_row * row_size as usize) + (x as usize * 4);
+                    let src_idx = data_offset + (src_row * row_size) + (x as usize * 4);
                     let dst = ((y * w + x) * 4) as usize;
                     rgba_data[dst] = data[src_idx + 2];
                     rgba_data[dst + 1] = data[src_idx + 1];
@@ -793,7 +909,99 @@ fn load_bmp(path: &Path) -> Result<LoadedImage, String> {
             }
         }
         1 | 4 | 8 => {
-            return Err(format!("Unsupported BMP bit depth: {}", bits_per_pixel));
+            // Reject RLE compression
+            if compression == 1 {
+                return Err(format!(
+                    "Unsupported BMP compression: BI_RLE8 in {}",
+                    path_display
+                ));
+            }
+            if compression == 2 {
+                return Err(format!(
+                    "Unsupported BMP compression: BI_RLE4 in {}",
+                    path_display
+                ));
+            }
+
+            // Parse color table
+            let max_colors: u32 = 1 << bits_per_pixel;
+            let clr_used = if data.len() >= 50 {
+                let v = u32::from_le_bytes([data[46], data[47], data[48], data[49]]);
+                if v == 0 {
+                    max_colors
+                } else {
+                    v
+                }
+            } else {
+                max_colors
+            };
+            if clr_used > max_colors {
+                return Err(format!(
+                    "Invalid BMP color table: biClrUsed {} exceeds max {} for {}-bit",
+                    clr_used, max_colors, bits_per_pixel
+                ));
+            }
+
+            let color_table_offset = 14 + dib_header_size;
+            let color_table_end = color_table_offset + clr_used as usize * 4;
+            if color_table_end > data.len() {
+                return Err("BMP color table truncated".to_string());
+            }
+
+            // Read BGRA color table entries
+            let mut palette = Vec::with_capacity(clr_used as usize);
+            for i in 0..clr_used as usize {
+                let off = color_table_offset + i * 4;
+                palette.push([data[off + 2], data[off + 1], data[off], 255]); // BGR_ -> RGBA
+            }
+
+            // Decode indexed pixels
+            for y in 0..h {
+                let src_row = if height > 0 {
+                    (h - 1 - y) as usize
+                } else {
+                    y as usize
+                };
+                let row_start = data_offset + src_row * row_size;
+
+                match bits_per_pixel {
+                    8 => {
+                        for x in 0..w {
+                            let idx = data[row_start + x as usize] as usize;
+                            let dst = ((y * w + x) * 4) as usize;
+                            if idx < palette.len() {
+                                rgba_data[dst..dst + 4].copy_from_slice(&palette[idx]);
+                            }
+                        }
+                    }
+                    4 => {
+                        for x in 0..w {
+                            let byte = data[row_start + (x as usize / 2)];
+                            let idx = if x % 2 == 0 {
+                                (byte >> 4) as usize // high nibble = left pixel
+                            } else {
+                                (byte & 0x0F) as usize // low nibble = right pixel
+                            };
+                            let dst = ((y * w + x) * 4) as usize;
+                            if idx < palette.len() {
+                                rgba_data[dst..dst + 4].copy_from_slice(&palette[idx]);
+                            }
+                        }
+                    }
+                    1 => {
+                        for x in 0..w {
+                            let byte = data[row_start + (x as usize / 8)];
+                            let bit = 7 - (x % 8); // MSB = leftmost pixel
+                            let idx = ((byte >> bit) & 1) as usize;
+                            let dst = ((y * w + x) * 4) as usize;
+                            if idx < palette.len() {
+                                rgba_data[dst..dst + 4].copy_from_slice(&palette[idx]);
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
         }
         _ => {
             return Err(format!("Unknown BMP bit depth: {}", bits_per_pixel));
@@ -1329,7 +1537,7 @@ pub fn rotate_90(img: RgbaImage) -> RgbaImage {
     out
 }
 
-fn rotate_180(img: RgbaImage) -> RgbaImage {
+pub(crate) fn rotate_180(img: RgbaImage) -> RgbaImage {
     let (w, h) = (img.width, img.height);
     let mut out = RgbaImage::new(w, h);
     for y in 0..h {
@@ -1357,7 +1565,7 @@ pub fn rotate_270(img: RgbaImage) -> RgbaImage {
     out
 }
 
-fn flip_h(img: RgbaImage) -> RgbaImage {
+pub(crate) fn flip_h(img: RgbaImage) -> RgbaImage {
     let (w, h) = (img.width, img.height);
     let mut out = RgbaImage::new(w, h);
     for y in 0..h {
@@ -1407,6 +1615,118 @@ pub fn read_exif_tags(data: &[u8]) -> Vec<(String, String)> {
         pos += 2 + seg_len;
     }
     Vec::new()
+}
+
+/// Read EXIF tags from raw TIFF data.
+/// TIFF files ARE TIFF structures, so the header is at byte 0.
+pub fn read_exif_tags_tiff(data: &[u8]) -> Vec<(String, String)> {
+    parse_all_exif_tags(data, 0)
+}
+
+/// Read EXIF orientation from raw TIFF data.
+/// (TIFF orientation is handled by libtiff during loading, but this is kept
+/// for API symmetry with the WebP/PNG orientation functions.)
+#[allow(dead_code)]
+pub fn read_exif_orientation_tiff(data: &[u8]) -> Option<u32> {
+    parse_tiff_orientation(data, 0)
+}
+
+/// Read EXIF tags from raw WebP data by walking the RIFF container for the EXIF chunk.
+pub fn read_exif_tags_webp(data: &[u8]) -> Vec<(String, String)> {
+    if let Some(exif_data) = extract_webp_exif(data) {
+        return parse_all_exif_tags(&exif_data, 0);
+    }
+    Vec::new()
+}
+
+/// Read EXIF orientation from raw WebP data.
+pub fn read_exif_orientation_webp(data: &[u8]) -> Option<u32> {
+    let exif_data = extract_webp_exif(data)?;
+    parse_tiff_orientation(&exif_data, 0)
+}
+
+/// Extract the EXIF payload from a WebP RIFF container.
+/// Returns the raw TIFF data (with Exif\0\0 prefix stripped if present).
+fn extract_webp_exif(data: &[u8]) -> Option<Vec<u8>> {
+    // Verify RIFF header: "RIFF" + 4-byte size + "WEBP"
+    if data.len() < 12 {
+        return None;
+    }
+    if &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
+        return None;
+    }
+
+    // Walk RIFF chunks starting at offset 12
+    let mut pos = 12;
+    while pos + 8 <= data.len() {
+        let fourcc = &data[pos..pos + 4];
+        let chunk_size =
+            u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                as usize;
+        let payload_start = pos + 8;
+        let payload_end = payload_start + chunk_size;
+
+        if fourcc == b"EXIF" {
+            if payload_end > data.len() {
+                return None;
+            }
+            let payload = &data[payload_start..payload_end];
+            // Some encoders prepend "Exif\0\0" (6 bytes) before the TIFF header
+            if payload.len() >= 6 && &payload[0..6] == b"Exif\0\0" {
+                return Some(payload[6..].to_vec());
+            }
+            return Some(payload.to_vec());
+        }
+
+        // Chunks are padded to even size
+        let padded_size = (chunk_size + 1) & !1;
+        pos = payload_start + padded_size;
+    }
+    None
+}
+
+/// Read EXIF tags from raw PNG data by scanning for the eXIf chunk.
+pub fn read_exif_tags_png(data: &[u8]) -> Vec<(String, String)> {
+    if let Some(exif_data) = extract_png_exif(data) {
+        return parse_all_exif_tags(&exif_data, 0);
+    }
+    Vec::new()
+}
+
+/// Read EXIF orientation from raw PNG data.
+pub fn read_exif_orientation_png(data: &[u8]) -> Option<u32> {
+    let exif_data = extract_png_exif(data)?;
+    parse_tiff_orientation(&exif_data, 0)
+}
+
+/// Extract EXIF payload from a PNG file by walking chunks for "eXIf".
+/// PNG chunks: 4-byte length + 4-byte type + payload + 4-byte CRC.
+fn extract_png_exif(data: &[u8]) -> Option<Vec<u8>> {
+    // PNG signature is 8 bytes
+    if data.len() < 8 || &data[0..4] != b"\x89PNG" {
+        return None;
+    }
+
+    let mut pos = 8; // skip PNG signature
+    while pos + 12 <= data.len() {
+        let chunk_len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let chunk_type = &data[pos + 4..pos + 8];
+        let payload_start = pos + 8;
+        let payload_end = payload_start + chunk_len;
+
+        if chunk_type == b"eXIf" {
+            if payload_end > data.len() {
+                return None;
+            }
+            // eXIf payload is raw TIFF data (no Exif\0\0 prefix)
+            return Some(data[payload_start..payload_end].to_vec());
+        }
+
+        // Move to next chunk: length + type(4) + payload + CRC(4)
+        pos = payload_end + 4;
+    }
+    None
 }
 
 fn parse_all_exif_tags(data: &[u8], tiff_offset: usize) -> Vec<(String, String)> {
@@ -1987,7 +2307,7 @@ fn read_gps_coord(d: &[u8], off: usize, le: bool) -> Option<(f64, f64, f64)> {
     Some((deg_n / deg_d, min_n / min_d, sec_n / sec_d))
 }
 
-fn flip_v(img: RgbaImage) -> RgbaImage {
+pub(crate) fn flip_v(img: RgbaImage) -> RgbaImage {
     let (w, h) = (img.width, img.height);
     let mut out = RgbaImage::new(w, h);
     for y in 0..h {
@@ -1998,4 +2318,464 @@ fn flip_v(img: RgbaImage) -> RgbaImage {
             .copy_from_slice(&img.data[src_row..src_row + row_bytes]);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========== Helper: create a small test image ==========
+
+    /// Create a 2x3 RGBA image with distinct pixel values.
+    /// Layout (row-major):
+    ///   (0,0)=R  (1,0)=G
+    ///   (0,1)=B  (1,1)=W
+    ///   (0,2)=Y  (1,2)=C
+    fn make_2x3_image() -> RgbaImage {
+        let mut img = RgbaImage::new(2, 3);
+        let pixels: &[[u8; 4]] = &[
+            [255, 0, 0, 255],     // R
+            [0, 255, 0, 255],     // G
+            [0, 0, 255, 255],     // B
+            [255, 255, 255, 255], // W
+            [255, 255, 0, 255],   // Y
+            [0, 255, 255, 255],   // C
+        ];
+        for (i, px) in pixels.iter().enumerate() {
+            let off = i * 4;
+            img.data[off..off + 4].copy_from_slice(px);
+        }
+        img
+    }
+
+    fn pixel_at(img: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
+        let off = ((y * img.width + x) * 4) as usize;
+        [
+            img.data[off],
+            img.data[off + 1],
+            img.data[off + 2],
+            img.data[off + 3],
+        ]
+    }
+
+    // ========== Transform tests ==========
+
+    #[test]
+    fn test_rotate_90() {
+        let img = make_2x3_image(); // 2x3
+        let out = rotate_90(img);
+        assert_eq!(out.dimensions(), (3, 2)); // width=old_h, height=old_w
+                                              // Original layout:
+                                              //   R G     Rotated 90 CW:
+                                              //   B W     Y B R
+                                              //   Y C     C W G
+        assert_eq!(pixel_at(&out, 0, 0), [255, 255, 0, 255]); // Y
+        assert_eq!(pixel_at(&out, 1, 0), [0, 0, 255, 255]); // B
+        assert_eq!(pixel_at(&out, 2, 0), [255, 0, 0, 255]); // R
+        assert_eq!(pixel_at(&out, 0, 1), [0, 255, 255, 255]); // C
+        assert_eq!(pixel_at(&out, 1, 1), [255, 255, 255, 255]); // W
+        assert_eq!(pixel_at(&out, 2, 1), [0, 255, 0, 255]); // G
+    }
+
+    #[test]
+    fn test_rotate_180() {
+        let img = make_2x3_image();
+        let out = rotate_180(img);
+        assert_eq!(out.dimensions(), (2, 3));
+        // 180: reverse all pixels
+        //   C Y
+        //   W B
+        //   G R
+        assert_eq!(pixel_at(&out, 0, 0), [0, 255, 255, 255]); // C
+        assert_eq!(pixel_at(&out, 1, 0), [255, 255, 0, 255]); // Y
+        assert_eq!(pixel_at(&out, 0, 1), [255, 255, 255, 255]); // W
+        assert_eq!(pixel_at(&out, 1, 1), [0, 0, 255, 255]); // B
+        assert_eq!(pixel_at(&out, 0, 2), [0, 255, 0, 255]); // G
+        assert_eq!(pixel_at(&out, 1, 2), [255, 0, 0, 255]); // R
+    }
+
+    #[test]
+    fn test_rotate_270() {
+        let img = make_2x3_image();
+        let out = rotate_270(img);
+        assert_eq!(out.dimensions(), (3, 2));
+        // 270 CW (= 90 CCW):
+        //   G W C
+        //   R B Y
+        assert_eq!(pixel_at(&out, 0, 0), [0, 255, 0, 255]); // G
+        assert_eq!(pixel_at(&out, 1, 0), [255, 255, 255, 255]); // W
+        assert_eq!(pixel_at(&out, 2, 0), [0, 255, 255, 255]); // C
+        assert_eq!(pixel_at(&out, 0, 1), [255, 0, 0, 255]); // R
+        assert_eq!(pixel_at(&out, 1, 1), [0, 0, 255, 255]); // B
+        assert_eq!(pixel_at(&out, 2, 1), [255, 255, 0, 255]); // Y
+    }
+
+    #[test]
+    fn test_flip_h() {
+        // Use a 2x2 image
+        let mut img = RgbaImage::new(2, 2);
+        img.data[0..4].copy_from_slice(&[255, 0, 0, 255]); // (0,0)=R
+        img.data[4..8].copy_from_slice(&[0, 255, 0, 255]); // (1,0)=G
+        img.data[8..12].copy_from_slice(&[0, 0, 255, 255]); // (0,1)=B
+        img.data[12..16].copy_from_slice(&[255, 255, 0, 255]); // (1,1)=Y
+
+        let out = flip_h(img);
+        assert_eq!(out.dimensions(), (2, 2));
+        assert_eq!(pixel_at(&out, 0, 0), [0, 255, 0, 255]); // G (was right)
+        assert_eq!(pixel_at(&out, 1, 0), [255, 0, 0, 255]); // R (was left)
+        assert_eq!(pixel_at(&out, 0, 1), [255, 255, 0, 255]); // Y
+        assert_eq!(pixel_at(&out, 1, 1), [0, 0, 255, 255]); // B
+    }
+
+    #[test]
+    fn test_flip_v() {
+        let mut img = RgbaImage::new(2, 2);
+        img.data[0..4].copy_from_slice(&[255, 0, 0, 255]); // (0,0)=R
+        img.data[4..8].copy_from_slice(&[0, 255, 0, 255]); // (1,0)=G
+        img.data[8..12].copy_from_slice(&[0, 0, 255, 255]); // (0,1)=B
+        img.data[12..16].copy_from_slice(&[255, 255, 0, 255]); // (1,1)=Y
+
+        let out = flip_v(img);
+        assert_eq!(out.dimensions(), (2, 2));
+        assert_eq!(pixel_at(&out, 0, 0), [0, 0, 255, 255]); // B (was bottom-left)
+        assert_eq!(pixel_at(&out, 1, 0), [255, 255, 0, 255]); // Y (was bottom-right)
+        assert_eq!(pixel_at(&out, 0, 1), [255, 0, 0, 255]); // R (was top-left)
+        assert_eq!(pixel_at(&out, 1, 1), [0, 255, 0, 255]); // G (was top-right)
+    }
+
+    // ========== BMP parser tests ==========
+
+    /// Build a minimal BMP byte array with the given parameters.
+    fn build_bmp(
+        width: u32,
+        height: i32,
+        bpp: u16,
+        compression: u32,
+        color_table: &[[u8; 4]],
+        pixel_data: &[u8],
+    ) -> Vec<u8> {
+        let dib_header_size: u32 = 40;
+        let color_table_bytes = color_table.len() as u32 * 4;
+        let data_offset = 14 + dib_header_size + color_table_bytes;
+        let file_size = data_offset + pixel_data.len() as u32;
+
+        let mut buf = Vec::with_capacity(file_size as usize);
+        // File header (14 bytes)
+        buf.extend_from_slice(b"BM");
+        buf.extend_from_slice(&file_size.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]); // reserved
+        buf.extend_from_slice(&data_offset.to_le_bytes());
+        // DIB header (40 bytes - BITMAPINFOHEADER)
+        buf.extend_from_slice(&dib_header_size.to_le_bytes());
+        buf.extend_from_slice(&(width as i32).to_le_bytes());
+        buf.extend_from_slice(&height.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // planes
+        buf.extend_from_slice(&bpp.to_le_bytes());
+        buf.extend_from_slice(&compression.to_le_bytes());
+        let image_size = pixel_data.len() as u32;
+        buf.extend_from_slice(&image_size.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 8]); // x/y pixels per meter
+        let clr_used = color_table.len() as u32;
+        buf.extend_from_slice(&clr_used.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // clrImportant
+                                                    // Color table
+        for entry in color_table {
+            buf.extend_from_slice(entry); // BGRA
+        }
+        // Pixel data
+        buf.extend_from_slice(pixel_data);
+        buf
+    }
+
+    #[test]
+    fn test_bmp_24bit() {
+        // 2x2 24-bit BMP, bottom-up
+        // Row size: (2*24+31)/32 * 4 = 8 bytes (2*3=6, padded to 8)
+        // Bottom-up: row0 in file = bottom row of image
+        let mut pixels = Vec::new();
+        // File row 0 -> image row 1 (bottom): B0=(0,1), B1=(1,1)
+        pixels.extend_from_slice(&[255, 0, 0]); // BGR -> pixel (0,1) = Red
+        pixels.extend_from_slice(&[0, 255, 0]); // BGR -> pixel (1,1) = Green
+        pixels.extend_from_slice(&[0, 0]); // padding to 8 bytes
+                                           // File row 1 -> image row 0 (top): B0=(0,0), B1=(1,0)
+        pixels.extend_from_slice(&[0, 0, 255]); // BGR -> pixel (0,0) = Blue
+        pixels.extend_from_slice(&[255, 255, 0]); // BGR -> pixel (1,0) = Yellow (B=0 G=255 R=255->Cyan??)
+        pixels.extend_from_slice(&[0, 0]); // padding
+
+        // Wait — BMP BGR means: byte0=Blue, byte1=Green, byte2=Red
+        // So [255,0,0] = B=255,G=0,R=0 -> Blue pixel
+        // Let me redo:
+        // pixel (0,1) -> in BMP file: [B, G, R] -> RGBA output = [R, G, B, 255]
+        // Let's use: pixel(0,0)=Red(R=255,G=0,B=0), pixel(1,0)=Green
+        let mut pixels = Vec::new();
+        // File row 0 = image row 1 (bottom-up)
+        // pixel(0,1) = want Blue: BGR=[255,0,0]
+        pixels.extend_from_slice(&[255, 0, 0]);
+        // pixel(1,1) = want White: BGR=[255,255,255]
+        pixels.extend_from_slice(&[255, 255, 255]);
+        pixels.extend_from_slice(&[0, 0]); // pad to 8
+                                           // File row 1 = image row 0
+                                           // pixel(0,0) = want Red: BGR=[0,0,255]
+        pixels.extend_from_slice(&[0, 0, 255]);
+        // pixel(1,0) = want Green: BGR=[0,255,0]
+        pixels.extend_from_slice(&[0, 255, 0]);
+        pixels.extend_from_slice(&[0, 0]); // pad to 8
+
+        let bmp = build_bmp(2, 2, 24, 0, &[], &pixels);
+        let result = decode_bmp(&bmp, "test").unwrap();
+        let img = match result {
+            LoadedImage::Static(img) => img,
+            _ => panic!("Expected static image"),
+        };
+        assert_eq!(img.dimensions(), (2, 2));
+        assert_eq!(pixel_at(&img, 0, 0), [255, 0, 0, 255]); // Red
+        assert_eq!(pixel_at(&img, 1, 0), [0, 255, 0, 255]); // Green
+        assert_eq!(pixel_at(&img, 0, 1), [0, 0, 255, 255]); // Blue
+        assert_eq!(pixel_at(&img, 1, 1), [255, 255, 255, 255]); // White
+    }
+
+    #[test]
+    fn test_bmp_8bit() {
+        // 2x1 8-bit BMP with 4-entry palette
+        // Row size: (2*8+31)/32 * 4 = 4 bytes
+        let palette: Vec<[u8; 4]> = vec![
+            [255, 0, 0, 0],     // index 0: B=255 -> Blue
+            [0, 255, 0, 0],     // index 1: G=255 -> Green
+            [0, 0, 255, 0],     // index 2: R=255 -> Red
+            [255, 255, 255, 0], // index 3: White
+        ];
+        // pixel(0,0) = index 2 (Red), pixel(1,0) = index 0 (Blue)
+        // Bottom-up 1-row, so file row 0 = image row 0
+        let pixels = vec![2, 0, 0, 0]; // indices + padding to 4 bytes
+
+        let bmp = build_bmp(2, 1, 8, 0, &palette, &pixels);
+        let result = decode_bmp(&bmp, "test").unwrap();
+        let img = match result {
+            LoadedImage::Static(img) => img,
+            _ => panic!("Expected static image"),
+        };
+        assert_eq!(img.dimensions(), (2, 1));
+        assert_eq!(pixel_at(&img, 0, 0), [255, 0, 0, 255]); // index 2 -> R=255 (palette entry [0,0,255,0] -> RGBA=[255,0,0,255])
+        assert_eq!(pixel_at(&img, 1, 0), [0, 0, 255, 255]); // index 0 -> B=255 (palette entry [255,0,0,0] -> RGBA=[0,0,255,255])
+    }
+
+    #[test]
+    fn test_bmp_4bit() {
+        // 3x1 4-bit BMP with 2-entry palette
+        // Row size: (3*4+31)/32 * 4 = 4 bytes
+        let palette: Vec<[u8; 4]> = vec![
+            [0, 0, 0, 0],       // index 0: Black -> RGBA=[0,0,0,255]
+            [255, 255, 255, 0], // index 1: White -> RGBA=[255,255,255,255]
+        ];
+        // 3 pixels: indices 1, 0, 1
+        // byte0: high nibble=1, low nibble=0 -> pixels 0,1
+        // byte1: high nibble=1, low nibble=0 (unused) -> pixel 2
+        let pixels = vec![0x10, 0x10, 0, 0]; // padded to 4 bytes
+
+        let bmp = build_bmp(3, 1, 4, 0, &palette, &pixels);
+        let result = decode_bmp(&bmp, "test").unwrap();
+        let img = match result {
+            LoadedImage::Static(img) => img,
+            _ => panic!("Expected static image"),
+        };
+        assert_eq!(img.dimensions(), (3, 1));
+        assert_eq!(pixel_at(&img, 0, 0), [255, 255, 255, 255]); // index 1 = white
+        assert_eq!(pixel_at(&img, 1, 0), [0, 0, 0, 255]); // index 0 = black
+        assert_eq!(pixel_at(&img, 2, 0), [255, 255, 255, 255]); // index 1 = white
+    }
+
+    #[test]
+    fn test_bmp_1bit() {
+        // 8x1 1-bit BMP with 2-entry palette
+        // Row size: (8*1+31)/32 * 4 = 4 bytes
+        let palette: Vec<[u8; 4]> = vec![
+            [0, 0, 0, 0],       // index 0: Black
+            [255, 255, 255, 0], // index 1: White
+        ];
+        // 8 pixels: 1,0,1,0,1,0,1,0 = 0b10101010 = 0xAA
+        let pixels = vec![0xAA, 0, 0, 0]; // padded to 4 bytes
+
+        let bmp = build_bmp(8, 1, 1, 0, &palette, &pixels);
+        let result = decode_bmp(&bmp, "test").unwrap();
+        let img = match result {
+            LoadedImage::Static(img) => img,
+            _ => panic!("Expected static image"),
+        };
+        assert_eq!(img.dimensions(), (8, 1));
+        // 0xAA = 10101010: MSB first, so pixels 0,2,4,6 = white; 1,3,5,7 = black
+        assert_eq!(pixel_at(&img, 0, 0), [255, 255, 255, 255]); // 1=white
+        assert_eq!(pixel_at(&img, 1, 0), [0, 0, 0, 255]); // 0=black
+        assert_eq!(pixel_at(&img, 2, 0), [255, 255, 255, 255]); // 1=white
+        assert_eq!(pixel_at(&img, 3, 0), [0, 0, 0, 255]); // 0=black
+        assert_eq!(pixel_at(&img, 7, 0), [0, 0, 0, 255]); // 0=black
+    }
+
+    #[test]
+    fn test_bmp_rle8_rejected() {
+        let palette: Vec<[u8; 4]> = vec![[0, 0, 0, 0]; 2];
+        let pixels = vec![0; 4];
+        let bmp = build_bmp(2, 1, 8, 1, &palette, &pixels); // compression=1 (BI_RLE8)
+        let result = decode_bmp(&bmp, "test.bmp");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("BI_RLE8"));
+    }
+
+    #[test]
+    fn test_bmp_rle4_rejected() {
+        let palette: Vec<[u8; 4]> = vec![[0, 0, 0, 0]; 2];
+        let pixels = vec![0; 4];
+        let bmp = build_bmp(2, 1, 4, 2, &palette, &pixels); // compression=2 (BI_RLE4)
+        let result = decode_bmp(&bmp, "test.bmp");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("BI_RLE4"));
+    }
+
+    // ========== EXIF parser tests ==========
+
+    /// Build a minimal TIFF structure with one IFD entry.
+    fn build_tiff_with_orientation(le: bool, orientation: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Byte order
+        if le {
+            buf.extend_from_slice(b"II");
+        } else {
+            buf.extend_from_slice(b"MM");
+        }
+        // Magic number 42
+        let magic: u16 = 42;
+        if le {
+            buf.extend_from_slice(&magic.to_le_bytes());
+        } else {
+            buf.extend_from_slice(&magic.to_be_bytes());
+        }
+        // IFD0 offset (= 8, right after header)
+        let ifd_offset: u32 = 8;
+        if le {
+            buf.extend_from_slice(&ifd_offset.to_le_bytes());
+        } else {
+            buf.extend_from_slice(&ifd_offset.to_be_bytes());
+        }
+
+        // IFD0: 1 entry
+        let entry_count: u16 = 1;
+        if le {
+            buf.extend_from_slice(&entry_count.to_le_bytes());
+        } else {
+            buf.extend_from_slice(&entry_count.to_be_bytes());
+        }
+
+        // IFD entry: tag=0x0112 (Orientation), type=SHORT(3), count=1, value=orientation
+        let tag: u16 = 0x0112;
+        let typ: u16 = 3; // SHORT
+        let count: u32 = 1;
+        if le {
+            buf.extend_from_slice(&tag.to_le_bytes());
+            buf.extend_from_slice(&typ.to_le_bytes());
+            buf.extend_from_slice(&count.to_le_bytes());
+            buf.extend_from_slice(&orientation.to_le_bytes());
+            buf.extend_from_slice(&[0, 0]); // pad value field to 4 bytes
+        } else {
+            buf.extend_from_slice(&tag.to_be_bytes());
+            buf.extend_from_slice(&typ.to_be_bytes());
+            buf.extend_from_slice(&count.to_be_bytes());
+            buf.extend_from_slice(&orientation.to_be_bytes());
+            buf.extend_from_slice(&[0, 0]); // pad
+        }
+
+        // Next IFD offset = 0 (no more IFDs)
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+
+        buf
+    }
+
+    #[test]
+    fn test_exif_orientation_le() {
+        let data = build_tiff_with_orientation(true, 6);
+        let result = parse_tiff_orientation(&data, 0);
+        assert_eq!(result, Some(6));
+    }
+
+    #[test]
+    fn test_exif_orientation_be() {
+        let data = build_tiff_with_orientation(false, 3);
+        let result = parse_tiff_orientation(&data, 0);
+        assert_eq!(result, Some(3));
+    }
+
+    #[test]
+    fn test_exif_tags_le() {
+        let data = build_tiff_with_orientation(true, 6);
+        let tags = parse_all_exif_tags(&data, 0);
+        // Should find at least the Orientation tag
+        let orient = tags.iter().find(|(label, _)| label == "Orientation");
+        assert!(orient.is_some(), "Orientation tag not found in {:?}", tags);
+    }
+
+    #[test]
+    fn test_exif_tags_be() {
+        let data = build_tiff_with_orientation(false, 1);
+        let tags = parse_all_exif_tags(&data, 0);
+        let orient = tags.iter().find(|(label, _)| label == "Orientation");
+        assert!(orient.is_some(), "Orientation tag not found in {:?}", tags);
+    }
+
+    #[test]
+    fn test_exif_webp_extraction() {
+        // Build a minimal RIFF/WEBP with an EXIF chunk containing a TIFF header
+        let tiff = build_tiff_with_orientation(true, 8);
+        let exif_chunk_size = tiff.len() as u32;
+
+        let mut webp = Vec::new();
+        webp.extend_from_slice(b"RIFF");
+        let riff_size = 4 + 8 + tiff.len(); // "WEBP" + chunk header + chunk data
+        webp.extend_from_slice(&(riff_size as u32).to_le_bytes());
+        webp.extend_from_slice(b"WEBP");
+        webp.extend_from_slice(b"EXIF");
+        webp.extend_from_slice(&exif_chunk_size.to_le_bytes());
+        webp.extend_from_slice(&tiff);
+        // Pad to even if needed
+        if tiff.len() % 2 != 0 {
+            webp.push(0);
+        }
+
+        let result = read_exif_orientation_webp(&webp);
+        assert_eq!(result, Some(8));
+    }
+
+    #[test]
+    fn test_exif_png_extraction() {
+        // Build a minimal PNG with an eXIf chunk containing a TIFF header
+        let tiff = build_tiff_with_orientation(false, 5);
+
+        let mut png = Vec::new();
+        // PNG signature
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        // eXIf chunk: length(4 BE) + "eXIf" + payload + CRC(4)
+        png.extend_from_slice(&(tiff.len() as u32).to_be_bytes());
+        png.extend_from_slice(b"eXIf");
+        png.extend_from_slice(&tiff);
+        png.extend_from_slice(&[0, 0, 0, 0]); // dummy CRC
+
+        let result = read_exif_orientation_png(&png);
+        assert_eq!(result, Some(5));
+    }
+
+    #[test]
+    fn test_exif_tiff_direct() {
+        let data = build_tiff_with_orientation(true, 2);
+        let result = read_exif_orientation_tiff(&data);
+        assert_eq!(result, Some(2));
+    }
+
+    #[test]
+    fn test_exif_invalid_data() {
+        let result = parse_tiff_orientation(&[0, 0, 0, 0], 0);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_exif_empty() {
+        let result = parse_tiff_orientation(&[], 0);
+        assert_eq!(result, None);
+    }
 }

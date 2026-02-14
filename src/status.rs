@@ -33,7 +33,7 @@ pub fn format_status(path: &Path, img_w: u32, img_h: u32, index: usize, total: u
     )
 }
 
-fn format_file_size(bytes: u64) -> String {
+pub(crate) fn format_file_size(bytes: u64) -> String {
     if bytes >= 1_000_000 {
         let whole = bytes / 1_000_000;
         let frac = (bytes % 1_000_000) / 100_000;
@@ -69,7 +69,7 @@ fn format_system_time(t: std::time::SystemTime) -> String {
 }
 
 /// Convert days since Unix epoch to (year, month, day).
-fn days_to_date(days: u64) -> (u64, u64, u64) {
+pub(crate) fn days_to_date(days: u64) -> (u64, u64, u64) {
     // Algorithm from http://howardhinnant.github.io/date_algorithms.html
     let z = days + 719468;
     let era = z / 146097;
@@ -102,4 +102,59 @@ pub fn draw_status_bar(buf: &mut [u32], buf_w: u32, buf_h: u32, text: &str) {
     let text_x = 6;
     let text_y = bar_y + 3;
     font::draw_string(buf, buf_w, buf_h, text, text_x, text_y, 0x00DDDDDD);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_file_size_bytes() {
+        assert_eq!(format_file_size(0), "0 B");
+        assert_eq!(format_file_size(999), "999 B");
+    }
+
+    #[test]
+    fn test_format_file_size_kb() {
+        assert_eq!(format_file_size(1000), "1.0 KB");
+        assert_eq!(format_file_size(1500), "1.5 KB");
+        assert_eq!(format_file_size(1536), "1.5 KB");
+        assert_eq!(format_file_size(999_999), "999.9 KB");
+    }
+
+    #[test]
+    fn test_format_file_size_mb() {
+        assert_eq!(format_file_size(1_000_000), "1.0 MB");
+        assert_eq!(format_file_size(2_400_000), "2.4 MB");
+        assert_eq!(format_file_size(10_500_000), "10.5 MB");
+    }
+
+    #[test]
+    fn test_days_to_date_epoch() {
+        // Unix epoch: Jan 1, 1970 = day 0
+        let (y, m, d) = days_to_date(0);
+        assert_eq!((y, m, d), (1970, 1, 1));
+    }
+
+    #[test]
+    fn test_days_to_date_known() {
+        // 2025-01-15 = 20103 days since epoch
+        // Let's verify with a well-known date: 2000-01-01 = 10957 days
+        let (y, m, d) = days_to_date(10957);
+        assert_eq!((y, m, d), (2000, 1, 1));
+    }
+
+    #[test]
+    fn test_days_to_date_leap_year() {
+        // 2000-02-29 = day 10957 + 59 = 11016 (2000 is a leap year)
+        let (y, m, d) = days_to_date(11016);
+        assert_eq!((y, m, d), (2000, 2, 29));
+    }
+
+    #[test]
+    fn test_days_to_date_end_of_year() {
+        // 1970-12-31 = day 364
+        let (y, m, d) = days_to_date(364);
+        assert_eq!((y, m, d), (1970, 12, 31));
+    }
 }
