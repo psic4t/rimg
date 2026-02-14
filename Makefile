@@ -1,15 +1,7 @@
 PREFIX ?= /usr/local
 BIN = rimg
 MAN = rimg.1
-SRC = $(shell find src -name '*.rs')
 TARGET = target/release/$(BIN)
-
-ifdef SUDO_USER
-  RUSTUP_HOME ?= $(shell echo ~$(SUDO_USER))/.rustup
-else
-  RUSTUP_HOME ?= $(HOME)/.rustup
-endif
-export RUSTUP_HOME
 
 .PHONY: all build release clean install uninstall
 
@@ -19,12 +11,13 @@ build:
 	cargo build
 
 release:
+ifdef SUDO_USER
+	sudo -u $(SUDO_USER) cargo build --release
+else
 	cargo build --release
+endif
 
-$(TARGET): $(SRC)
-	cargo build --release
-
-install: $(TARGET)
+install: release
 	install -Dm755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(BIN)
 	install -Dm644 $(MAN) $(DESTDIR)$(PREFIX)/share/man/man1/$(MAN)
 	install -Dm644 README.md $(DESTDIR)$(PREFIX)/share/doc/$(BIN)/README.md
