@@ -108,9 +108,10 @@ impl ShmBuffer {
             self.mmap_len = 0;
         }
 
-        let stride = width * 4;
-        let buf_size = (stride * height) as usize;
-        let pool_size = buf_size * 2; // double buffer
+        // Use checked arithmetic to prevent overflow in buffer size calculations
+        let stride = (width as usize).checked_mul(4).expect("SHM stride overflow");
+        let buf_size = stride.checked_mul(height as usize).expect("SHM buffer size overflow");
+        let pool_size = buf_size.checked_mul(2).expect("SHM pool size overflow"); // double buffer
 
         // Resize the memfd
         rustix::fs::ftruncate(&self.fd, pool_size as u64).expect("ftruncate failed");
@@ -163,8 +164,8 @@ impl ShmBuffer {
 
     /// Get a mutable slice to the current back buffer pixel data.
     fn back_buffer_mut(&mut self) -> &mut [u32] {
-        let stride = self.width * 4;
-        let buf_size = (stride * self.height) as usize;
+        let stride = self.width as usize * 4;
+        let buf_size = stride * self.height as usize;
         let offset = self.current * buf_size;
         let ptr = unsafe { self.mmap_ptr.add(offset) as *mut u32 };
         let len = (self.width * self.height) as usize;

@@ -9,6 +9,16 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif", "svg",
 ];
 
+/// Maximum pixel count to prevent excessive memory allocation (256 megapixels).
+const MAX_PIXEL_COUNT: u64 = 256 * 1024 * 1024;
+
+/// Maximum file size to read into memory (512 MiB).
+const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
+
+/// Maximum directory recursion depth to prevent stack overflow from symlink loops
+/// or deeply nested directories.
+const MAX_DIR_DEPTH: u32 = 64;
+
 /// Simple RGBA image buffer.
 #[derive(Clone)]
 pub struct RgbaImage {
@@ -19,15 +29,22 @@ pub struct RgbaImage {
 
 impl RgbaImage {
     pub fn new(width: u32, height: u32) -> Self {
+        let size = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))
+            .expect("Image dimensions too large");
         Self {
-            data: vec![0u8; (width * height * 4) as usize],
+            data: vec![0u8; size],
             width,
             height,
         }
     }
 
     pub fn from_raw(width: u32, height: u32, data: Vec<u8>) -> Option<Self> {
-        if data.len() == (width * height * 4) as usize {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4))?;
+        if data.len() == expected {
             Some(Self {
                 data,
                 width,
@@ -62,13 +79,46 @@ impl LoadedImage {
     }
 }
 
+/// Read a file into memory with a size limit to prevent excessive allocation.
+fn read_file_limited(path: &Path) -> Result<Vec<u8>, String> {
+    let meta =
+        fs::metadata(path).map_err(|e| format!("Failed to stat {}: {}", path.display(), e))?;
+    if meta.len() > MAX_FILE_SIZE {
+        return Err(format!(
+            "File too large ({} bytes, max {}): {}",
+            meta.len(),
+            MAX_FILE_SIZE,
+            path.display()
+        ));
+    }
+    fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))
+}
+
+/// Validate image dimensions against maximum pixel count.
+fn validate_dimensions(width: u32, height: u32, format: &str) -> Result<(), String> {
+    let pixels = width as u64 * height as u64;
+    if pixels > MAX_PIXEL_COUNT {
+        return Err(format!(
+            "{} image too large: {}x{} ({} pixels, max {})",
+            format, width, height, pixels, MAX_PIXEL_COUNT
+        ));
+    }
+    if width == 0 || height == 0 {
+        return Err(format!(
+            "{} image has zero dimension: {}x{}",
+            format, width, height
+        ));
+    }
+    Ok(())
+}
+
 /// Collect image paths from CLI arguments.
 pub fn collect_paths(args: &[String]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for arg in args {
         let p = PathBuf::from(arg);
         if p.is_dir() {
-            scan_directory(&p, &mut paths);
+            scan_directory(&p, &mut paths, 0);
         } else if is_supported_image(&p) {
             paths.push(p);
         }
@@ -77,15 +127,22 @@ pub fn collect_paths(args: &[String]) -> Vec<PathBuf> {
     paths
 }
 
-fn scan_directory(dir: &Path, out: &mut Vec<PathBuf>) {
+fn scan_directory(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
+    if depth >= MAX_DIR_DEPTH {
+        return;
+    }
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // Skip symlinks to prevent symlink loops and traversal outside target
+        if path.is_symlink() {
+            continue;
+        }
         if path.is_dir() {
-            scan_directory(&path, out);
+            scan_directory(&path, out, depth + 1);
         } else if is_supported_image(&path) {
             out.push(path);
         }
@@ -124,10 +181,12 @@ pub fn load_image(path: &Path) -> Result<LoadedImage, String> {
 // ============================================================
 
 fn load_jpeg(path: &Path) -> Result<LoadedImage, String> {
-    let data = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let data = read_file_limited(path)?;
 
     let image = turbojpeg::decompress(&data, turbojpeg::PixelFormat::RGBA)
         .map_err(|e| format!("Failed to decode JPEG {}: {}", path.display(), e))?;
+
+    validate_dimensions(image.width as u32, image.height as u32, "JPEG")?;
 
     let mut img = RgbaImage::from_raw(image.width as u32, image.height as u32, image.pixels)
         .ok_or_else(|| "JPEG pixel buffer size mismatch".to_string())?;
@@ -236,7 +295,7 @@ unsafe extern "C" fn png_read_callback(
 }
 
 fn load_png(path: &Path) -> Result<LoadedImage, String> {
-    let data = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let data = read_file_limited(path)?;
 
     // Check PNG signature
     if data.len() < 8 || &data[0..4] != b"\x89PNG" {
@@ -257,7 +316,12 @@ fn load_png(path: &Path) -> Result<LoadedImage, String> {
             return Err("png_create_info_struct failed".to_string());
         }
 
-        // Set up error handling via setjmp
+        // Set up error handling via setjmp.
+        // SAFETY: longjmp will jump back here on libpng errors. We must ensure
+        // no Rust objects with Drop impls are live across the longjmp boundary.
+        // The Vec allocations (rgba_data, row_ptrs) below will be leaked if
+        // longjmp fires during png_read_image, but this is preferable to UB.
+        // We use raw pointers to track them for cleanup on the error path.
         let jmpbuf = libpng::png_set_longjmp_fn(
             png_ptr,
             libpng::longjmp,
@@ -307,6 +371,19 @@ fn load_png(path: &Path) -> Result<LoadedImage, String> {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         );
+
+        // Validate dimensions before allocating buffers
+        if width == 0 || height == 0 || (width as u64) * (height as u64) > MAX_PIXEL_COUNT {
+            let mut pp = png_ptr;
+            let mut ip = info_ptr;
+            libpng::png_destroy_read_struct(&mut pp, &mut ip, std::ptr::null_mut());
+            return Err(format!(
+                "PNG dimensions too large or zero: {}x{} in {}",
+                width,
+                height,
+                path.display()
+            ));
+        }
 
         // Set transforms to get RGBA output
         let ct = color_type as c_uchar;
@@ -360,7 +437,7 @@ fn load_png(path: &Path) -> Result<LoadedImage, String> {
 // ============================================================
 
 fn load_webp(path: &Path) -> Result<LoadedImage, String> {
-    let data = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let data = read_file_limited(path)?;
 
     let mut width: std::ffi::c_int = 0;
     let mut height: std::ffi::c_int = 0;
@@ -372,11 +449,31 @@ fn load_webp(path: &Path) -> Result<LoadedImage, String> {
         return Err(format!("Failed to decode WebP {}", path.display()));
     }
 
+    // Validate dimensions: reject negative or zero values from libwebp
+    if width <= 0 || height <= 0 {
+        unsafe {
+            libwebp_sys::WebPFree(ptr as *mut std::ffi::c_void);
+        }
+        return Err(format!(
+            "Invalid WebP dimensions: {}x{} in {}",
+            width,
+            height,
+            path.display()
+        ));
+    }
+
     let w = width as u32;
     let h = height as u32;
-    let len = (w * h * 4) as usize;
+    validate_dimensions(w, h, "WebP").map_err(|e| {
+        unsafe {
+            libwebp_sys::WebPFree(ptr as *mut std::ffi::c_void);
+        }
+        e
+    })?;
 
-    let rgba_data = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
+    // Use u64 to prevent overflow in length calculation
+    let len = w as u64 * h as u64 * 4;
+    let rgba_data = unsafe { std::slice::from_raw_parts(ptr, len as usize).to_vec() };
     unsafe {
         libwebp_sys::WebPFree(ptr as *mut std::ffi::c_void);
     }
@@ -514,8 +611,27 @@ fn load_gif(path: &Path) -> Result<LoadedImage, String> {
             return Err(format!("Empty GIF: {}", path.display()));
         }
 
+        // Validate canvas dimensions to prevent overflow in allocation
+        if (canvas_w as u64) * (canvas_h as u64) > MAX_PIXEL_COUNT {
+            libgif::DGifCloseFile(gif, std::ptr::null_mut());
+            return Err(format!(
+                "GIF canvas too large: {}x{} in {}",
+                canvas_w,
+                canvas_h,
+                path.display()
+            ));
+        }
+
+        let canvas_size = (canvas_w as usize)
+            .checked_mul(canvas_h as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| {
+                libgif::DGifCloseFile(gif, std::ptr::null_mut());
+                format!("GIF canvas overflow: {}x{}", canvas_w, canvas_h)
+            })?;
+
         let mut frames: Vec<(RgbaImage, Duration)> = Vec::with_capacity(image_count);
-        let mut canvas = vec![0u8; (canvas_w * canvas_h * 4) as usize];
+        let mut canvas = vec![0u8; canvas_size];
 
         for i in 0..image_count {
             let saved = &*(*gif).SavedImages.add(i);
@@ -604,7 +720,7 @@ fn load_gif(path: &Path) -> Result<LoadedImage, String> {
 // ============================================================
 
 fn load_bmp(path: &Path) -> Result<LoadedImage, String> {
-    let data = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let data = read_file_limited(path)?;
 
     if data.len() < 54 {
         return Err("File too small to be BMP".to_string());
@@ -624,14 +740,22 @@ fn load_bmp(path: &Path) -> Result<LoadedImage, String> {
     }
 
     let (w, h) = (width as u32, height.unsigned_abs() as u32);
-    let row_size = ((w * bits_per_pixel as u32 + 31) / 32) * 4;
-    let expected_size = data_offset + (row_size * h) as usize;
+    validate_dimensions(w, h, "BMP")?;
 
-    if data.len() < expected_size {
+    // Use u64 arithmetic to prevent overflow in row_size and expected_size calculations
+    let row_size_u64 = ((w as u64 * bits_per_pixel as u64 + 31) / 32) * 4;
+    let expected_size_u64 = data_offset as u64 + row_size_u64 * h as u64;
+
+    if (data.len() as u64) < expected_size_u64 {
         return Err("BMP file truncated".to_string());
     }
 
-    let mut rgba_data = vec![0u8; (w * h * 4) as usize];
+    let row_size = row_size_u64 as usize;
+    let pixel_count = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "BMP dimensions overflow".to_string())?;
+    let mut rgba_data = vec![0u8; pixel_count];
 
     match bits_per_pixel {
         24 => {
@@ -732,7 +856,21 @@ fn load_tiff(path: &Path) -> Result<LoadedImage, String> {
             return Err(format!("Failed to get TIFF dimensions {}", path.display()));
         }
 
-        let npixels = (w as usize) * (h as usize);
+        // Validate dimensions before allocation
+        if w == 0 || h == 0 || (w as u64) * (h as u64) > MAX_PIXEL_COUNT {
+            libtiff::TIFFClose(tif);
+            return Err(format!(
+                "TIFF dimensions invalid or too large: {}x{} in {}",
+                w,
+                h,
+                path.display()
+            ));
+        }
+
+        let npixels = (w as usize).checked_mul(h as usize).ok_or_else(|| {
+            libtiff::TIFFClose(tif);
+            format!("TIFF dimensions overflow: {}x{}", w, h)
+        })?;
         let mut raster: Vec<u32> = vec![0u32; npixels];
 
         let ok = libtiff::TIFFReadRGBAImageOriented(
@@ -862,8 +1000,27 @@ fn load_svg(path: &Path) -> Result<LoadedImage, String> {
             h = 1024.0;
         }
 
+        // Clamp SVG dimensions to prevent excessive memory allocation
+        let max_svg_dim = 16384.0; // 16K pixels per side
+        if w > max_svg_dim || h > max_svg_dim {
+            let scale = (max_svg_dim / w).min(max_svg_dim / h);
+            w *= scale;
+            h *= scale;
+        }
+
         let pw = w.ceil() as c_int;
         let ph = h.ceil() as c_int;
+
+        // Validate pixel count
+        if (pw as u64) * (ph as u64) > MAX_PIXEL_COUNT {
+            librsvg::g_object_unref(handle);
+            return Err(format!(
+                "SVG dimensions too large: {}x{} in {}",
+                pw,
+                ph,
+                path.display()
+            ));
+        }
 
         // Create cairo image surface
         let surface = librsvg::cairo_image_surface_create(librsvg::CAIRO_FORMAT_ARGB32, pw, ph);
@@ -974,7 +1131,7 @@ pub fn load_image_thumbnail(path: &Path, thumb_size: u32) -> Result<RgbaImage, S
 
 /// Load a JPEG at reduced resolution using DCT scaling, then resize to thumbnail.
 fn load_jpeg_thumbnail(path: &Path, thumb_size: u32) -> Result<RgbaImage, String> {
-    let data = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let data = read_file_limited(path)?;
 
     let mut decompressor = turbojpeg::Decompressor::new()
         .map_err(|e| format!("Failed to create decompressor: {}", e))?;

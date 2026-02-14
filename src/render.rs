@@ -40,7 +40,11 @@ pub fn scale_to_fill(img: &RgbaImage, target_w: u32, target_h: u32) -> RgbaImage
     let crop_x = (scaled_w.saturating_sub(target_w)) / 2;
     let crop_y = (scaled_h.saturating_sub(target_h)) / 2;
     let raw = scaled.as_raw();
-    let mut out = vec![0u8; (target_w * target_h * 4) as usize];
+    let out_size = (target_w as usize)
+        .checked_mul(target_h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .expect("Scale-to-fill dimensions too large");
+    let mut out = vec![0u8; out_size];
 
     for y in 0..target_h {
         let sy = crop_y + y;
@@ -76,7 +80,11 @@ fn resize_rgba(src: &RgbaImage, dst_w: u32, dst_h: u32) -> RgbaImage {
     }
 
     let raw = src.as_raw();
-    let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
+    let out_size = (dst_w as usize)
+        .checked_mul(dst_h as usize)
+        .and_then(|n| n.checked_mul(4))
+        .expect("Resize dimensions too large");
+    let mut out = vec![0u8; out_size];
 
     let x_ratio = if dst_w > 1 {
         (src_w - 1) as f64 / (dst_w - 1) as f64
@@ -138,7 +146,10 @@ pub fn composite_centered(
     offset_y: i32,
 ) -> Vec<u32> {
     let (img_w, img_h) = img.dimensions();
-    let mut buf = vec![BG_COLOR; (win_w * win_h) as usize];
+    let buf_len = (win_w as usize)
+        .checked_mul(win_h as usize)
+        .expect("Composite dimensions too large");
+    let mut buf = vec![BG_COLOR; buf_len];
 
     // Center position plus pan offset
     let cx = (win_w as i32 - img_w as i32) / 2 + offset_x;

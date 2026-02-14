@@ -349,10 +349,16 @@ impl App {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if ext == "jpg" || ext == "jpeg" {
-                if let Ok(data) = std::fs::read(path) {
-                    let tags = image_loader::read_exif_tags(&data);
-                    self.viewer.set_exif_data(tags);
-                    return;
+                // Only read EXIF from reasonably-sized files (64 MiB limit for metadata)
+                let too_large = std::fs::metadata(path)
+                    .map(|m| m.len() > 64 * 1024 * 1024)
+                    .unwrap_or(true);
+                if !too_large {
+                    if let Ok(data) = std::fs::read(path) {
+                        let tags = image_loader::read_exif_tags(&data);
+                        self.viewer.set_exif_data(tags);
+                        return;
+                    }
                 }
             }
             self.viewer.set_exif_data(Vec::new());
